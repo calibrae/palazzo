@@ -32,21 +32,31 @@ impl Embedder {
         })
     }
 
-    /// Embed a single string. ONNX inference is synchronous and CPU-bound; we
-    /// hold a Mutex and run on the current Tokio worker (short enough not to
-    /// warrant spawn_blocking for our traffic volume).
+    /// Embed a single string.
+    ///
+    /// ONNX inference is synchronous and CPU-bound — 50-200 ms+ per call. It
+    /// MUST run on `spawn_blocking`, not the async worker: blocking a Tokio
+    /// worker thread for that long stalls every other future it is responsible
+    /// for, including the Streamable-HTTP MCP sessions' keep-alive and read
+    /// tasks. That stall is exactly what made agents "lose MCP mid-insertion".
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         // nomic-embed-text-v1.5 expects an instruction prefix for search-corpus
         // documents; without it embeddings are still usable but slightly off
         // from the model card's reference. The Ollama-side pipeline does NOT
         // add the prefix, so we omit it here too — the point is to stay as
         // close as possible to the existing vectors in `claude-memory`.
-        let mut guard = self.inner.lock().await;
-        let mut out = guard
-            .embed(vec![text], None)
-            .map_err(|e| anyhow!("fastembed: {e}"))?;
-        out.pop()
-            .ok_or_else(|| anyhow!("fastembed returned zero embeddings"))
+        let inner = self.inner.clone();
+        let text = text.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_lock();
+            let mut out = guard
+                .embed(vec![text.as_str()], None)
+                .map_err(|e| anyhow!("fastembed: {e}"))?;
+            out.pop()
+                .ok_or_else(|| anyhow!("fastembed returned zero embeddings"))
+        })
+        .await
+        .context("fastembed embed task join")?
     }
 
     /// Embed a batch of strings, sub-chunked so the ONNX runtime arenas stay
@@ -55,6 +65,10 @@ impl Embedder {
     /// into groups of `FASTEMBED_BATCH_CHUNK` (default 16, override with the
     /// env var of the same name) and concatenate; per-call ONNX overhead is
     /// dwarfed by the matmul itself, so throughput barely moves.
+    ///
+    /// Runs on `spawn_blocking` for the same reason as [`Self::embed`] — a
+    /// multi-chunk batch can occupy a CPU for seconds, which must never happen
+    /// on an async worker thread.
     pub async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -64,15 +78,21 @@ impl Embedder {
             .and_then(|s| s.parse().ok())
             .filter(|n: &usize| *n > 0)
             .unwrap_or(16);
-        let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-        let mut guard = self.inner.lock().await;
-        for chunk in texts.chunks(chunk_size) {
-            let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-            let mut vecs = guard
-                .embed(refs, None)
-                .map_err(|e| anyhow!("fastembed batch: {e}"))?;
-            out.append(&mut vecs);
-        }
-        Ok(out)
+        let inner = self.inner.clone();
+        let texts = texts.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.blocking_lock();
+            let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+            for chunk in texts.chunks(chunk_size) {
+                let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+                let mut vecs = guard
+                    .embed(refs, None)
+                    .map_err(|e| anyhow!("fastembed batch: {e}"))?;
+                out.append(&mut vecs);
+            }
+            Ok(out)
+        })
+        .await
+        .context("fastembed embed_batch task join")?
     }
 }
