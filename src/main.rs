@@ -61,7 +61,10 @@ impl Config {
     }
 
     fn make_palace(&self) -> Result<Palace> {
-        let embedder = make_embedder(self)?;
+        self.make_palace_with_embedder(make_embedder(self)?)
+    }
+
+    fn make_palace_with_embedder(&self, embedder: Embedder) -> Result<Palace> {
         let qdrant = Qdrant::new(&self.qdrant_url, &self.collection);
         let wal = Wal::from_env();
         let tracker = make_tracker();
@@ -500,13 +503,23 @@ async fn run_http(rest: &[String]) -> Result<()> {
         }
     }
 
-    // Pre-built Palace shared by /ingest. /mcp keeps its own per-session factory
-    // because StreamableHttpService wants a fresh service per session.
-    let ingest_palace = std::sync::Arc::new(cfg.make_palace()?);
+    // Single Embedder shared across all MCP sessions and /ingest.
+    // Embedder::Clone shares the inner Arc<Mutex<TextEmbedding>> and Arc<AtomicU64>
+    // so there is exactly one TextEmbedding in memory and one background watcher,
+    // regardless of how many concurrent sessions are open. Per-session Palace
+    // instances each hold a clone of this same Arc — no additional model loads.
+    let shared_embedder = make_embedder(&cfg)?;
+    let ingest_palace =
+        std::sync::Arc::new(cfg.make_palace_with_embedder(shared_embedder.clone())?);
     let cfg = std::sync::Arc::new(cfg);
     let mcp_cfg = cfg.clone();
+    let mcp_embedder = shared_embedder;
     let service = StreamableHttpService::new(
-        move || mcp_cfg.make_palace().map_err(std::io::Error::other),
+        move || {
+            mcp_cfg
+                .make_palace_with_embedder(mcp_embedder.clone())
+                .map_err(std::io::Error::other)
+        },
         LocalSessionManager::default().into(),
         http_config,
     );

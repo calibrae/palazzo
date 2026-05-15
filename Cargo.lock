@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "palazzo"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "anyhow",
  "async-stream",
