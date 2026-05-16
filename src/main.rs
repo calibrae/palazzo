@@ -372,6 +372,7 @@ async fn ingest_handler(
     }
 
     let total = items.len();
+    metrics::counter!("palazzo_ingest_items_total").increment(total as u64);
     tracing::info!(items = total, "POST /ingest streaming start");
 
     let stream = async_stream::stream! {
@@ -499,6 +500,10 @@ async fn run_http(rest: &[String]) -> Result<()> {
         tracing::warn!("ensure_indexes: {e:#}");
     }
 
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("prometheus recorder");
+
     let ct = CancellationToken::new();
     let ct_child = ct.child_token();
     let mut http_config = StreamableHttpServerConfig::default().with_cancellation_token(ct_child);
@@ -593,10 +598,18 @@ async fn run_http(rest: &[String]) -> Result<()> {
     let health_route = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
         .with_state(health_state);
+    let metrics_route = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move || {
+            let body = metrics_handle.render();
+            async move { body }
+        }),
+    );
     let router = axum::Router::new()
         .nest_service("/mcp", service)
         .merge(ingest_route)
-        .merge(health_route);
+        .merge(health_route)
+        .merge(metrics_route);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("bind {bind}"))?;

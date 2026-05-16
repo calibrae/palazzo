@@ -207,18 +207,25 @@ impl Palace {
         started: Instant,
         res: anyhow::Result<T>,
     ) -> Result<CallToolResult, McpError> {
-        let exec_ms = started.elapsed().as_millis() as u64;
+        let elapsed = started.elapsed();
+        let exec_ms = elapsed.as_millis() as u64;
+        let secs = elapsed.as_secs_f64();
         match res {
             Ok(v) => {
                 let body = serde_json::to_value(&v).unwrap_or_default().to_string();
                 self.tracker
                     .record(tool, None, true, exec_ms, body.len() as u64);
+                metrics::counter!("palazzo_tool_calls_total", "tool" => tool, "status" => "ok")
+                    .increment(1);
+                metrics::histogram!("palazzo_tool_duration_seconds", "tool" => tool).record(secs);
                 Ok(CallToolResult::success(vec![Content::text(body)]))
             }
             Err(e) => {
                 let msg = format!("{e:#}");
                 self.tracker
                     .record(tool, None, false, exec_ms, msg.len() as u64);
+                metrics::counter!("palazzo_tool_calls_total", "tool" => tool, "status" => "error")
+                    .increment(1);
                 Err(McpError::internal_error(msg, None))
             }
         }

@@ -152,6 +152,7 @@ impl Qdrant {
         if points.is_empty() {
             return Ok(());
         }
+        let t0 = std::time::Instant::now();
         let url = self.url("/points?wait=true");
         let body = UpsertBody { points };
         let resp = self
@@ -166,6 +167,8 @@ impl Qdrant {
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow!("qdrant upsert {}: {}", status, text));
         }
+        metrics::histogram!("palazzo_qdrant_duration_seconds", "op" => "upsert")
+            .record(t0.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -196,6 +199,7 @@ impl Qdrant {
         limit: u32,
         filter: &FindFilter,
     ) -> Result<Vec<Memory>> {
+        let t0 = std::time::Instant::now();
         let url = self.url("/points/search");
         let mut body = json!({
             "vector": vector,
@@ -217,6 +221,8 @@ impl Qdrant {
             .json()
             .await
             .context("qdrant search decode")?;
+        metrics::histogram!("palazzo_qdrant_duration_seconds", "op" => "search")
+            .record(t0.elapsed().as_secs_f64());
         Ok(resp
             .result
             .into_iter()

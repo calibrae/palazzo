@@ -115,6 +115,7 @@ impl Embedder {
         // close as possible to the existing vectors in `claude-memory`.
         let inner = self.inner.clone();
         let text = text.to_string();
+        let t0 = std::time::Instant::now();
         let out = tokio::task::spawn_blocking(move || {
             let mut guard = inner.blocking_lock();
             let mut out = guard
@@ -125,6 +126,8 @@ impl Embedder {
         })
         .await
         .context("fastembed embed task join")?;
+        metrics::histogram!("palazzo_embed_duration_seconds", "mode" => "single")
+            .record(t0.elapsed().as_secs_f64());
         self.last_embed_at.store(now_secs(), Ordering::Release);
         out
     }
@@ -150,6 +153,7 @@ impl Embedder {
             .unwrap_or(16);
         let inner = self.inner.clone();
         let texts = texts.to_vec();
+        let t0 = std::time::Instant::now();
         let out = tokio::task::spawn_blocking(move || {
             let mut guard = inner.blocking_lock();
             let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
@@ -164,6 +168,8 @@ impl Embedder {
         })
         .await
         .context("fastembed embed_batch task join")?;
+        metrics::histogram!("palazzo_embed_duration_seconds", "mode" => "batch")
+            .record(t0.elapsed().as_secs_f64());
         self.last_embed_at.store(now_secs(), Ordering::Release);
         out
     }
@@ -225,6 +231,7 @@ impl Embedder {
                             *guard = fresh;
                         }
                         let after = current_rss_mb().unwrap_or(0);
+                        metrics::counter!("palazzo_embedder_recycles_total").increment(1);
                         tracing::info!(rss_mb = after, "fastembed embedder recycled");
                     }
                     Ok(Err(e)) => {

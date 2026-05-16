@@ -1,6 +1,6 @@
 [package]
 name = "palazzo"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 description = "Self-contained Rust MCP memory palace — Qdrant + local fastembed, typed wing/room/hall schema, temporal supersede, token-savings analytics."
 repository = "https://github.com/calibrae/palazzo"
@@ -35,6 +35,8 @@ schemars = "1.1"
 fastembed = { version = "5", optional = true }
 mcp-gain = { git = "https://github.com/calibrae/mcp-gain", tag = "v0.1.0" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 
 [profile.release]
 lto = "thin"
