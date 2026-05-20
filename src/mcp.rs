@@ -14,7 +14,7 @@ use serde_json::json;
 use crate::baselines;
 use crate::embed::Embedder;
 use crate::qdrant::{FindFilter, PointUpsert, Qdrant};
-use crate::schema::{Category, Hall, Memory, Payload, Wing};
+use crate::schema::{Memory, Payload};
 use crate::util::now_rfc3339;
 use crate::wal::Wal;
 
@@ -31,6 +31,10 @@ const MAX_SUPERSEDES: usize = 50;
 /// is ~8 MB request payload — well under any sensible HTTP limit and tractable for the
 /// embedder in one batch. Bigger bulk loads should issue multiple calls.
 pub const MAX_STORE_BATCH: usize = 256;
+/// Max byte length of a free-text taxonomy tag (category / wing / room / hall).
+/// Generous — these are short labels, not prose; 64 bytes stops accidental
+/// essays-as-tags without constraining real use.
+const MAX_TAG_BYTES: usize = 64;
 
 #[derive(Clone)]
 pub struct Palace {
@@ -48,14 +52,17 @@ pub struct Palace {
 pub struct StoreArgs {
     /// The memory to file. Store verbatim — do not summarise.
     pub text: String,
-    /// Palace category.
-    pub category: Category,
-    /// Palace wing.
-    pub wing: Wing,
+    /// Category — free-text. Conventionally one of: person, career, technical,
+    /// infrastructure, project-memory, vibe, project — but any value is accepted.
+    pub category: String,
+    /// Wing — free-text. Conventionally one of: projects, infrastructure,
+    /// personal, career, vibe — but any value is accepted.
+    pub wing: String,
     /// Room — free-text topic or project (e.g. "palazzo", "hermytt", "family").
     pub room: String,
-    /// Hall — facts / events / decisions / discoveries / preferences.
-    pub hall: Hall,
+    /// Hall — free-text. Conventionally one of: facts, events, decisions,
+    /// discoveries, preferences — but any value is accepted.
+    pub hall: String,
     /// Optional session identifier — the conversation that produced this memory.
     #[serde(default)]
     pub session: Option<String>,
@@ -70,10 +77,13 @@ pub struct StoreArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct StoreBatchItem {
     pub text: String,
-    pub category: Category,
-    pub wing: Wing,
+    /// Free-text — see `palace_store` for conventional category values.
+    pub category: String,
+    /// Free-text — see `palace_store` for conventional wing values.
+    pub wing: String,
     pub room: String,
-    pub hall: Hall,
+    /// Free-text — see `palace_store` for conventional hall values.
+    pub hall: String,
     #[serde(default)]
     pub session: Option<String>,
     #[serde(default)]
@@ -115,15 +125,18 @@ pub struct FindArgs {
     /// Max results. Default 5, max 20.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Exact-match wing filter (free-text).
     #[serde(default)]
-    pub wing: Option<Wing>,
+    pub wing: Option<String>,
+    /// Exact-match category filter (free-text).
     #[serde(default)]
-    pub category: Option<Category>,
+    pub category: Option<String>,
     /// Exact-match room filter.
     #[serde(default)]
     pub room: Option<String>,
+    /// Exact-match hall filter (free-text).
     #[serde(default)]
-    pub hall: Option<Hall>,
+    pub hall: Option<String>,
     /// Inclusive lower bound on memory timestamp (RFC3339 second-precision, e.g.
     /// "2026-04-01T00:00:00Z"). Memories older than this are excluded.
     #[serde(default)]
@@ -150,10 +163,13 @@ pub struct SupersedeArgs {
     pub supersedes: Vec<u64>,
     /// The corrected / updated memory text (stored verbatim, embedded).
     pub text: String,
-    pub category: Category,
-    pub wing: Wing,
+    /// Free-text — see `palace_store` for conventional category values.
+    pub category: String,
+    /// Free-text — see `palace_store` for conventional wing values.
+    pub wing: String,
     pub room: String,
-    pub hall: Hall,
+    /// Free-text — see `palace_store` for conventional hall values.
+    pub hall: String,
     #[serde(default)]
     pub session: Option<String>,
     #[serde(default)]
@@ -346,6 +362,10 @@ impl Palace {
         if args.text.trim().is_empty() {
             anyhow::bail!("text is empty");
         }
+        let category = validate_tag("category", &args.category)?;
+        let wing = validate_tag("wing", &args.wing)?;
+        let room = validate_tag("room", &args.room)?;
+        let hall = validate_tag("hall", &args.hall)?;
         let vec = self.embedder.embed(&args.text).await?;
 
         // Duplicate check — if the top hit is above threshold, skip the write and return the existing ID.
@@ -373,10 +393,10 @@ impl Palace {
         let id = new_id();
         let timestamp = now_rfc3339();
         let payload = Payload {
-            category: args.category.as_str().to_string(),
-            wing: args.wing.as_str().to_string(),
-            room: args.room.clone(),
-            hall: args.hall.as_str().to_string(),
+            category,
+            wing,
+            room,
+            hall,
             text: args.text.clone(),
             timestamp: timestamp.clone(),
             session: args.session.clone(),
@@ -440,6 +460,8 @@ impl Palace {
                 ));
             } else if item.text.trim().is_empty() {
                 item_errors[i] = Some("text is empty".into());
+            } else if let Err(e) = validate_item_tags(item) {
+                item_errors[i] = Some(format!("{e:#}"));
             }
         }
 
@@ -519,10 +541,10 @@ impl Palace {
             let item = &args.items[idx];
             let id = new_id_for_index(slot);
             let payload = Payload {
-                category: item.category.as_str().to_string(),
-                wing: item.wing.as_str().to_string(),
-                room: item.room.clone(),
-                hall: item.hall.as_str().to_string(),
+                category: item.category.trim().to_string(),
+                wing: item.wing.trim().to_string(),
+                room: item.room.trim().to_string(),
+                hall: item.hall.trim().to_string(),
                 text: item.text.clone(),
                 timestamp: now.clone(),
                 session: item.session.clone(),
@@ -639,9 +661,9 @@ impl Palace {
                         duplicate_of: None,
                         matched_score: None,
                         text: Some(item.text),
-                        wing: Some(item.wing.as_str().to_string()),
-                        room: Some(item.room),
-                        hall: Some(item.hall.as_str().to_string()),
+                        wing: Some(item.wing.trim().to_string()),
+                        room: Some(item.room.trim().to_string()),
+                        hall: Some(item.hall.trim().to_string()),
                         timestamp: Some(now.clone()),
                     });
                 }
@@ -674,10 +696,11 @@ impl Palace {
             Some(now_rfc3339())
         };
         let filter = FindFilter {
-            wing: args.wing.map(|w| w.as_str().to_string()),
-            category: args.category.map(|c| c.as_str().to_string()),
-            room: args.room,
-            hall: args.hall.map(|h| h.as_str().to_string()),
+            // Trim filter values so " facts" still matches a stored "facts" tag.
+            wing: args.wing.map(|w| w.trim().to_string()),
+            category: args.category.map(|c| c.trim().to_string()),
+            room: args.room.map(|r| r.trim().to_string()),
+            hall: args.hall.map(|h| h.trim().to_string()),
             since: args.since,
             until: args.until,
             exclude_superseded_before,
@@ -731,6 +754,10 @@ impl Palace {
         if args.reason.trim().is_empty() {
             anyhow::bail!("reason is empty — say why the supersession happened");
         }
+        let category = validate_tag("category", &args.category)?;
+        let wing = validate_tag("wing", &args.wing)?;
+        let room = validate_tag("room", &args.room)?;
+        let hall = validate_tag("hall", &args.hall)?;
         if args.supersedes.is_empty() {
             anyhow::bail!("supersedes is empty — nothing to supersede");
         }
@@ -746,10 +773,10 @@ impl Palace {
         let id = new_id();
         let now = now_rfc3339();
         let payload = Payload {
-            category: args.category.as_str().to_string(),
-            wing: args.wing.as_str().to_string(),
-            room: args.room.clone(),
-            hall: args.hall.as_str().to_string(),
+            category,
+            wing: wing.clone(),
+            room: room.clone(),
+            hall: hall.clone(),
             text: args.text.clone(),
             timestamp: now.clone(),
             session: args.session.clone(),
@@ -808,9 +835,9 @@ impl Palace {
         Ok(SupersedeResult {
             id,
             text: args.text,
-            wing: args.wing.as_str().to_string(),
-            room: args.room,
-            hall: args.hall.as_str().to_string(),
+            wing,
+            room,
+            hall,
             timestamp: now,
             supersedes: args.supersedes,
             reason: args.reason,
@@ -932,8 +959,9 @@ impl ServerHandler for Palace {
         .with_protocol_version(ProtocolVersion::LATEST)
         .with_instructions(
             "palazzo — Cali's memory palace over MCP. \
-             Every memory has a wing (projects/infrastructure/nexpublica/personal/career/vibe), \
-             a room (free-text project or topic), and a hall (facts/events/decisions/discoveries/preferences). \
+             Every memory is filed under four free-text labels — category, wing, room, hall — \
+             organise them however suits you. Conventionally wing is one of projects/infrastructure/personal/career/vibe \
+             and hall is one of facts/events/decisions/discoveries/preferences, but any value is accepted. \
              Tools: palace_store, palace_store_batch, palace_find, palace_recall, palace_status, palace_taxonomy, palace_check_duplicate, palace_supersede, palace_gain. \
              For bulk migrations of pre-existing data (>~10K tokens of payload), prefer the sibling REST endpoint POST /ingest on the same host:port \
              (Content-Type: application/x-ndjson, body = JSONL of palace_store items). Invoke via Bash(curl --data-binary @file) — the bytes flow through curl's body and never enter the MCP transcript, \
@@ -1022,6 +1050,34 @@ fn facet_map(items: &[(String, u64)]) -> serde_json::Value {
         m.insert(k.clone(), json!(v));
     }
     serde_json::Value::Object(m)
+}
+
+/// Validate a free-text taxonomy field (category / wing / room / hall). Trims
+/// surrounding whitespace, rejects empty / whitespace-only values and tags over
+/// `MAX_TAG_BYTES`. Returns the trimmed string to store, so " facts " and
+/// "facts" never silently split into two distinct tags.
+fn validate_tag(field: &str, value: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{field} is empty");
+    }
+    if trimmed.len() > MAX_TAG_BYTES {
+        anyhow::bail!(
+            "{field} too long: {} bytes (max {MAX_TAG_BYTES})",
+            trimmed.len()
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate all four taxonomy tags of a batch item up-front, so a doomed item
+/// fails before the batch reaches the embedder.
+fn validate_item_tags(item: &StoreBatchItem) -> anyhow::Result<()> {
+    validate_tag("category", &item.category)?;
+    validate_tag("wing", &item.wing)?;
+    validate_tag("room", &item.room)?;
+    validate_tag("hall", &item.hall)?;
+    Ok(())
 }
 
 fn preview(s: &str) -> String {

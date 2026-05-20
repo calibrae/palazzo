@@ -73,10 +73,12 @@ cœur, l'agent connaît le schéma et vous guide :
 
 | Champ | Valeurs | Exemple |
 |---|---|---|
-| `category` | `person` · `career` · `technical` · `infrastructure` · `project-memory` · `vibe` · `project` | `technical` |
-| `wing` | `projects` · `infrastructure` · `nexpublica` · `personal` · `career` · `vibe` | `projects` |
+| `category` | texte libre — conventionnellement `person` · `career` · `technical` · `infrastructure` · `project-memory` · `vibe` · `project` | `technical` |
+| `wing` | texte libre — conventionnellement `projects` · `infrastructure` · `personal` · `career` · `vibe` | `projects` |
 | `room` | texte libre — nom du projet ou du sujet | `mon-projet`, `api-paiement`, `équipe-backend` |
-| `hall` | `facts` · `events` · `decisions` · `discoveries` · `preferences` | `decisions` |
+| `hall` | texte libre — conventionnellement `facts` · `events` · `decisions` · `discoveries` · `preferences` | `decisions` |
+
+Les quatre axes sont du texte libre — les valeurs ci-dessus sont des conventions, pas des contraintes. Organisez votre palais comme bon vous semble.
 
 ### Stocker une mémoire simple (`palace_store`)
 

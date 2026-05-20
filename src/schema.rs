@@ -1,77 +1,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum Category {
-    Person,
-    Career,
-    Technical,
-    Infrastructure,
-    ProjectMemory,
-    Vibe,
-    Project,
-}
-
-impl Category {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Category::Person => "person",
-            Category::Career => "career",
-            Category::Technical => "technical",
-            Category::Infrastructure => "infrastructure",
-            Category::ProjectMemory => "project-memory",
-            Category::Vibe => "vibe",
-            Category::Project => "project",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum Wing {
-    Projects,
-    Infrastructure,
-    Nexpublica,
-    Personal,
-    Career,
-    Vibe,
-}
-
-impl Wing {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Wing::Projects => "projects",
-            Wing::Infrastructure => "infrastructure",
-            Wing::Nexpublica => "nexpublica",
-            Wing::Personal => "personal",
-            Wing::Career => "career",
-            Wing::Vibe => "vibe",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum Hall {
-    Facts,
-    Events,
-    Decisions,
-    Discoveries,
-    Preferences,
-}
-
-impl Hall {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Hall::Facts => "facts",
-            Hall::Events => "events",
-            Hall::Decisions => "decisions",
-            Hall::Discoveries => "discoveries",
-            Hall::Preferences => "preferences",
-        }
-    }
-}
+// category / wing / room / hall are deliberately free-text — the palace
+// taxonomy is whatever the user makes of it. Conventional values are suggested
+// in the `palace_store` tool-arg descriptions but never enforced. Light
+// validation (non-empty, length-capped, trimmed) lives in `mcp.rs::validate_tag`.
 
 /// The payload we write to Qdrant. Mirrors the palace schema established 2026-04-19,
 /// extended 2026-04-24 with temporal-validity fields (valid_from / valid_until /

@@ -69,17 +69,17 @@ The palace becomes a journal, not a snapshot — every correction is an append, 
 Every point carries:
 
 ```
-category:    person | career | technical | infrastructure | project-memory | vibe | project
-wing:        projects | infrastructure | nexpublica | personal | career | vibe
+category:    free-text — conventionally person | career | technical | infrastructure | project-memory | vibe | project
+wing:        free-text — conventionally projects | infrastructure | personal | career | vibe
 room:        free-text (project or topic)
-hall:        facts | events | decisions | discoveries | preferences
+hall:        free-text — conventionally facts | events | decisions | discoveries | preferences
 text:        the memory itself, verbatim
 timestamp:   RFC3339 UTC
 session:     optional conversation identifier
 source_file: optional MD path when imported
 ```
 
-IDs ≥ `1_000_000_000` are reserved for auto-generation (unix-millis). The palace schema enums are defined in [`src/schema.rs`](src/schema.rs).
+`category` / `wing` / `room` / `hall` are all free-text — the conventional values above are suggestions, not constraints; organise the palace however suits you. They are validated only for non-emptiness and a 64-byte length cap. IDs ≥ `1_000_000_000` are reserved for auto-generation (unix-millis). The palace `Payload` / `Memory` structs are defined in [`src/schema.rs`](src/schema.rs).
 
 ## Config
 
