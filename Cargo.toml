@@ -1,6 +1,6 @@
 [package]
 name = "palazzo"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2024"
 description = "Self-contained Rust MCP memory palace — Qdrant + local fastembed, typed wing/room/hall schema, temporal supersede, token-savings analytics."
 repository = "https://github.com/calibrae/palazzo"

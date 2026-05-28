@@ -966,6 +966,7 @@ impl ServerHandler for Palace {
              For bulk migrations of pre-existing data (>~10K tokens of payload), prefer the sibling REST endpoint POST /ingest on the same host:port \
              (Content-Type: application/x-ndjson, body = JSONL of palace_store items). Invoke via Bash(curl --data-binary @file) — the bytes flow through curl's body and never enter the MCP transcript, \
              unlike palace_store_batch tool args which do. Same backend (embed, dedup, WAL, upsert), zero context cost for the payload. \
+             For exporting the palace (backups, migration, filtered slices), the sibling GET /export streams the collection as NDJSON — one point per line, optional 768-dim vector and the same filter knobs as palace_find (wing/category/room/hall/since/until/include_superseded). Curl the URL straight to a file; bytes never enter the MCP transcript. \
              Error handling: if any tool call returns 'Session not found', the MCP session was reset (server restarted). \
              Retry the exact same call once — the client will re-establish the session automatically and the retry will succeed.".to_string(),
         )
