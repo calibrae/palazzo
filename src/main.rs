@@ -742,7 +742,9 @@ async fn run_http(rest: &[String]) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
-    tracing::info!("listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /export (NDJSON stream)");
+    tracing::info!(
+        "listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /export (NDJSON stream)"
+    );
 
     let shutdown = ct.clone();
     axum::serve(listener, router)
