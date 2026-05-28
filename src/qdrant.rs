@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::schema::{Memory, Payload};
+use crate::schema::{ExportPoint, Memory, Payload};
 
 #[derive(Clone)]
 pub struct Qdrant {
@@ -108,6 +108,21 @@ struct ScoredPoint {
 struct RetrievedPoint {
     id: Value,
     payload: Option<Payload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScrolledPoint {
+    id: Value,
+    payload: Option<Payload>,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScrollResult {
+    points: Vec<ScrolledPoint>,
+    #[serde(default)]
+    next_page_offset: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,6 +334,49 @@ impl Qdrant {
         Ok(out)
     }
 
+    /// Scroll through points in the collection with optional filtering and pagination.
+    /// Returns a page of points and the next page offset (if more pages exist).
+    /// Useful for streaming large result sets without loading everything into memory.
+    pub async fn scroll(
+        &self,
+        limit: usize,
+        offset: Option<Value>,
+        filter: &FindFilter,
+        with_vector: bool,
+    ) -> Result<(Vec<ExportPoint>, Option<Value>)> {
+        let url = self.url("/points/scroll");
+        let mut body = json!({
+            "limit": limit,
+            "with_payload": true,
+            "with_vector": with_vector,
+        });
+        if let Some(o) = offset {
+            body["offset"] = o;
+        }
+        if let Some(f) = filter.to_qdrant_filter() {
+            body["filter"] = f;
+        }
+        let resp: ResultWrapper<ScrollResult> = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .context("qdrant scroll status")?
+            .json()
+            .await
+            .context("qdrant scroll decode")?;
+        let points = resp
+            .result
+            .points
+            .into_iter()
+            .filter_map(to_export_point)
+            .collect();
+        Ok((points, resp.result.next_page_offset))
+    }
+
     /// Ensure keyword indexes exist on wing, category, room, hall, plus a
     /// datetime index on `timestamp` for since/until range queries. Idempotent —
     /// Qdrant accepts re-creation as no-op.
@@ -381,4 +439,26 @@ fn hydrate(id: u64, score: Option<f32>, pl: Payload) -> Memory {
         superseded_by: pl.superseded_by,
         superseded_reason: pl.superseded_reason,
     }
+}
+
+fn to_export_point(p: ScrolledPoint) -> Option<ExportPoint> {
+    let id = id_as_u64(&p.id)?;
+    let pl = p.payload?;
+    Some(ExportPoint {
+        id,
+        text: pl.text,
+        category: pl.category,
+        wing: pl.wing,
+        room: pl.room,
+        hall: pl.hall,
+        timestamp: pl.timestamp,
+        session: pl.session,
+        source_file: pl.source_file,
+        valid_from: pl.valid_from,
+        valid_until: pl.valid_until,
+        supersedes: pl.supersedes,
+        superseded_by: pl.superseded_by,
+        superseded_reason: pl.superseded_reason,
+        vector: p.vector,
+    })
 }

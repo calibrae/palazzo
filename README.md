@@ -196,6 +196,21 @@ The response is **streamed NDJSON** — one progress line per processed batch (d
 
 Use `curl -N` to disable client-side buffering and watch progress live. Errors during processing emit a `{"chunk":N,"error":"..."}` line and close the stream. Body parse failures still return `400` with a plain-text body before any streaming starts.
 
+### Export collection as NDJSON (`GET /export`)
+
+Stream the entire collection (or filtered subset) as **NDJSON**, one point per line. Pagination via Qdrant's scroll API keeps memory bounded:
+
+```
+curl 'http://palazzo-host:6334/export?vectors=false&wing=projects' | head -5
+```
+
+Query params (all optional):
+- `vectors=true|false` (default **true** — include the 768-dim embedding vector)
+- `wing`, `category`, `room`, `hall`, `since`, `until` — same semantics as `palace_find`. Values are trimmed.
+- `include_superseded=true|false` (default **false** — by default, only current-truth memories)
+
+Each line is a JSON object with all point fields plus optional `vector`. Errors emit `{"error":"..."}` and close the stream. Bad RFC3339 timestamps return `400` before streaming starts. Same `PALAZZO_ALLOWED_HOSTS` allowlist as `/mcp`.
+
 ### Bulk ingest from a file (`palazzo ingest`)
 
 ```

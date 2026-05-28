@@ -69,3 +69,31 @@ pub struct Memory {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_reason: Option<String>,
 }
+
+/// A point as returned by the `GET /export` HTTP endpoint — includes the vector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportPoint {
+    pub id: u64,
+    pub text: String,
+    pub category: String,
+    pub wing: String,
+    pub room: String,
+    pub hall: String,
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<Vec<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector: Option<Vec<f32>>,
+}

@@ -448,6 +448,128 @@ async fn health_handler(
     }))
 }
 
+/// Query params for `GET /export`.
+#[derive(serde::Deserialize)]
+struct ExportParams {
+    #[serde(default = "default_true")]
+    vectors: bool,
+    #[serde(default)]
+    wing: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    room: Option<String>,
+    #[serde(default)]
+    hall: Option<String>,
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
+    #[serde(default)]
+    include_superseded: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// GET /export handler. Streams the collection as NDJSON via the scroll API.
+async fn export_handler(
+    axum::extract::State(qdrant): axum::extract::State<Arc<Qdrant>>,
+    axum::extract::Query(params): axum::extract::Query<ExportParams>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Validate RFC3339 timestamps up front.
+    for (name, val) in [("since", &params.since), ("until", &params.until)] {
+        if let Some(s) = val
+            && crate::util::parse_rfc3339(s).is_none()
+        {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "{} must be RFC3339 second-precision UTC (e.g. 2026-04-20T00:00:00Z), got {:?}\n",
+                    name, s
+                ),
+            )
+                .into_response();
+        }
+    }
+
+    // Build the filter.
+    let exclude_superseded_before = if params.include_superseded {
+        None
+    } else {
+        Some(crate::util::now_rfc3339())
+    };
+    let filter = FindFilter {
+        wing: params.wing.map(|w| w.trim().to_string()),
+        category: params.category.map(|c| c.trim().to_string()),
+        room: params.room.map(|r| r.trim().to_string()),
+        hall: params.hall.map(|h| h.trim().to_string()),
+        since: params.since,
+        until: params.until,
+        exclude_superseded_before,
+    };
+
+    metrics::counter!("palazzo_export_requests_total").increment(1);
+    tracing::info!(vectors = params.vectors, "GET /export streaming start");
+
+    const PAGE_SIZE: usize = 256;
+    let qdrant_for_stream = qdrant.clone();
+    let stream = async_stream::stream! {
+        let mut offset: Option<serde_json::Value> = None;
+        let mut total_points = 0u64;
+
+        loop {
+            match qdrant_for_stream.scroll(PAGE_SIZE, offset.clone(), &filter, params.vectors).await {
+                Ok((points, next_offset)) => {
+                    let page_count = points.len();
+                    for pt in points {
+                        total_points += 1;
+                        match serde_json::to_string(&pt) {
+                            Ok(line) => {
+                                yield Ok::<_, std::io::Error>(
+                                    axum::body::Bytes::from(format!("{line}\n"))
+                                );
+                                metrics::counter!("palazzo_export_points_total").increment(1);
+                            }
+                            Err(e) => {
+                                let err_line = serde_json::json!({
+                                    "error": format!("serialize point: {e}"),
+                                });
+                                yield Ok(axum::body::Bytes::from(format!("{err_line}\n")));
+                                return;
+                            }
+                        }
+                    }
+                    if next_offset.is_none() || page_count < PAGE_SIZE {
+                        // No more pages.
+                        break;
+                    }
+                    offset = next_offset;
+                }
+                Err(e) => {
+                    let err_line = serde_json::json!({
+                        "error": format!("{e:#}"),
+                    });
+                    yield Ok(axum::body::Bytes::from(format!("{err_line}\n")));
+                    return;
+                }
+            }
+        }
+
+        tracing::info!(total = total_points, "GET /export streaming complete");
+    };
+
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+        .header("X-Accel-Buffering", "no")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
+}
+
 async fn run_stdio() -> Result<()> {
     let cfg = Config::from_env();
     tracing::info!(
@@ -600,6 +722,10 @@ async fn run_http(rest: &[String]) -> Result<()> {
     let health_route = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
         .with_state(health_state);
+    let qdrant_for_export = Arc::new(cfg.make_qdrant());
+    let export_route = axum::Router::new()
+        .route("/export", axum::routing::get(export_handler))
+        .with_state(qdrant_for_export);
     let metrics_route = axum::Router::new().route(
         "/metrics",
         axum::routing::get(move || {
@@ -611,11 +737,12 @@ async fn run_http(rest: &[String]) -> Result<()> {
         .nest_service("/mcp", service)
         .merge(ingest_route)
         .merge(health_route)
+        .merge(export_route)
         .merge(metrics_route);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
-    tracing::info!("listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk)");
+    tracing::info!("listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /export (NDJSON stream)");
 
     let shutdown = ct.clone();
     axum::serve(listener, router)
