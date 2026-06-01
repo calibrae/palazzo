@@ -27,6 +27,8 @@ const MAX_RECALL_IDS: usize = 100;
 /// Cap on how many points can be superseded in one tool call. Large batches are usually a
 /// design smell — revisit the model or run multiple calls.
 const MAX_SUPERSEDES: usize = 50;
+/// Cap on how many points can be deleted in one tool call.
+const MAX_DELETE_IDS: usize = 100;
 /// Cap on items per `palace_store_batch` call. At 32 KB/text * 256 items the upper bound
 /// is ~8 MB request payload — well under any sensible HTTP limit and tractable for the
 /// embedder in one batch. Bigger bulk loads should issue multiple calls.
@@ -185,6 +187,17 @@ pub struct RecallArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteArgs {
+    /// Point IDs to hard-delete from the palace. 1..=MAX_DELETE_IDS.
+    pub ids: Vec<u64>,
+    /// Short human explanation of why this delete is happening. Recorded
+    /// to the WAL as the only audit trail; required (the tool refuses an
+    /// empty reason). Examples: "PII scrub — citizen surnames",
+    /// "test fixtures left over from smoke run", "duplicate of #12345".
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CheckDuplicateArgs {
     /// Candidate text. Returns the closest existing memory and whether it's above the duplicate threshold (0.95).
     pub text: String,
@@ -323,6 +336,18 @@ impl Palace {
         let started = Instant::now();
         let res = self.do_supersede(args).await;
         self.finish_tool("palace_supersede", started, res)
+    }
+
+    #[tool(
+        description = "Hard-delete one or more points by ID. Use this for true removal (PII scrubs, test garbage, mistakes) — for fact corrections that should leave a visible audit trail, prefer palace_supersede (soft-delete). Each delete is WAL-logged BEFORE the Qdrant call with the point's full payload and your reason, so the WAL is a recoverable audit even though the live point is gone. Missing IDs are idempotent: deleting a non-existent ID returns ok:true, missing:true. Cap: 100 IDs per call."
+    )]
+    async fn palace_delete(
+        &self,
+        Parameters(args): Parameters<DeleteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let res = self.do_delete(args).await;
+        self.finish_tool("palace_delete", started, res)
     }
 
     #[tool(
@@ -845,6 +870,84 @@ impl Palace {
         })
     }
 
+    async fn do_delete(&self, args: DeleteArgs) -> anyhow::Result<DeleteResult> {
+        if args.reason.trim().is_empty() {
+            anyhow::bail!("reason is empty — say why this delete is happening");
+        }
+        if args.ids.is_empty() {
+            anyhow::bail!("ids is empty — nothing to delete");
+        }
+        if args.ids.len() > MAX_DELETE_IDS {
+            anyhow::bail!("too many ids: {} (max {MAX_DELETE_IDS})", args.ids.len());
+        }
+
+        // Retrieve full payloads for all requested IDs so we can WAL-log them.
+        let retrieved = self.qdrant.retrieve(args.ids.clone()).await?;
+        let mut retrieved_map: std::collections::HashMap<u64, Memory> =
+            retrieved.into_iter().map(|m| (m.id, m)).collect();
+
+        // Build per-ID entries and WAL-log each existing point before deletion.
+        let mut deleted_entries = Vec::with_capacity(args.ids.len());
+        let mut counts = DeleteCounts::default();
+
+        for id in &args.ids {
+            if let Some(mem) = retrieved_map.remove(id) {
+                // WAL-log this deletion before we call Qdrant.
+                self.wal.log(
+                    "palace_delete",
+                    &json!({
+                        "id": id,
+                        "wing": mem.wing,
+                        "room": mem.room,
+                        "hall": mem.hall,
+                        "category": mem.category,
+                        "text_preview": preview(&mem.text),
+                        "session": mem.session,
+                        "reason": args.reason,
+                    }),
+                );
+                counts.deleted += 1;
+                deleted_entries.push(DeleteEntry {
+                    id: *id,
+                    ok: true,
+                    missing: false,
+                    error: None,
+                    text_preview: Some(preview(&mem.text)),
+                });
+            } else {
+                // ID did not exist.
+                counts.missing += 1;
+                deleted_entries.push(DeleteEntry {
+                    id: *id,
+                    ok: true,
+                    missing: true,
+                    error: None,
+                    text_preview: None,
+                });
+            }
+        }
+
+        // Now call Qdrant to delete all requested IDs (both existing and missing).
+        // Missing IDs are silently ok from Qdrant's perspective.
+        if let Err(e) = self.qdrant.delete(&args.ids).await {
+            // Mark all entries as failed if the delete call fails.
+            let error_msg = format!("{e:#}");
+            for entry in &mut deleted_entries {
+                entry.ok = false;
+                entry.error = Some(error_msg.clone());
+            }
+            counts.failed = deleted_entries.len() as u32;
+            counts.deleted = 0;
+            counts.missing = 0;
+        }
+
+        Ok(DeleteResult {
+            deleted: deleted_entries,
+            counts,
+            reason: args.reason,
+        })
+    }
+
     async fn do_recall(&self, args: RecallArgs) -> anyhow::Result<Vec<Memory>> {
         if args.ids.len() > MAX_RECALL_IDS {
             anyhow::bail!("too many ids: {} (max {MAX_RECALL_IDS})", args.ids.len());
@@ -949,6 +1052,36 @@ struct SupersededEntry {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct DeleteResult {
+    deleted: Vec<DeleteEntry>,
+    counts: DeleteCounts,
+    reason: String,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct DeleteCounts {
+    deleted: u32,
+    missing: u32,
+    failed: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteEntry {
+    id: u64,
+    ok: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    missing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text_preview: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[tool_handler]
 impl ServerHandler for Palace {
     fn get_info(&self) -> ServerInfo {
@@ -962,7 +1095,8 @@ impl ServerHandler for Palace {
              Every memory is filed under four free-text labels — category, wing, room, hall — \
              organise them however suits you. Conventionally wing is one of projects/infrastructure/personal/career/vibe \
              and hall is one of facts/events/decisions/discoveries/preferences, but any value is accepted. \
-             Tools: palace_store, palace_store_batch, palace_find, palace_recall, palace_status, palace_taxonomy, palace_check_duplicate, palace_supersede, palace_gain. \
+             Tools: palace_store, palace_store_batch, palace_find, palace_recall, palace_status, palace_taxonomy, palace_check_duplicate, palace_supersede, palace_delete, palace_gain. \
+             Hard-delete via palace_delete is reserved for PII scrubs / garbage / mistakes; for fact corrections that should leave a visible audit trail, prefer palace_supersede. \
              For bulk migrations of pre-existing data (>~10K tokens of payload), prefer the sibling REST endpoint POST /ingest on the same host:port \
              (Content-Type: application/x-ndjson, body = JSONL of palace_store items). Invoke via Bash(curl --data-binary @file) — the bytes flow through curl's body and never enter the MCP transcript, \
              unlike palace_store_batch tool args which do. Same backend (embed, dedup, WAL, upsert), zero context cost for the payload. \

@@ -41,6 +41,7 @@ Neither upstream is vendored. Both are linked above; please follow and star thei
 | `palace_taxonomy` | Flat facet dump of wing / room / hall / category counts. |
 | `palace_check_duplicate` | Probe whether candidate text already exists above the 0.95 cosine threshold. |
 | `palace_supersede` | Replace one or more existing memories with a corrected version. Marks the old points with `valid_until`, `superseded_by`, `superseded_reason`; default `palace_find` hides them. |
+| `palace_delete` | Hard-delete one or more points by ID. Required `reason` is WAL-logged before the Qdrant call. Use sparingly — `palace_supersede` is the audited soft-delete path. Cap: 100 IDs per call. |
 | `palace_store_batch` | Bulk-ingest up to 256 memories in one call. Embeds the whole batch in one ONNX/Ollama inference pass and bulk-upserts to Qdrant in one HTTP call (~3-5× faster than N single-item calls). Per-item dedup against the live palace; result returns per-item status, IDs, and dedup hits. Designed for migrations and bulk imports. |
 | `palace_gain` | Token-savings report. Aggregates the per-tool gain log and returns a `Summary` of how many tokens of agent context this server saved versus a hand-coded SSH+curl+jq equivalent. Optional `since` (RFC3339) and `include_text` flags. |
 

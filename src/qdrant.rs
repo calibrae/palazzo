@@ -208,6 +208,31 @@ impl Qdrant {
         Ok(())
     }
 
+    /// Hard-delete one or more points by ID. Missing IDs are silently ok.
+    pub async fn delete(&self, ids: &[u64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let t0 = std::time::Instant::now();
+        let url = self.url("/points/delete?wait=true");
+        let body = json!({ "points": ids });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("qdrant delete: {status} {text}"));
+        }
+        metrics::histogram!("palazzo_qdrant_duration_seconds", "op" => "delete")
+            .record(t0.elapsed().as_secs_f64());
+        Ok(())
+    }
+
     pub async fn search(
         &self,
         vector: Vec<f32>,
