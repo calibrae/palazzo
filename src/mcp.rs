@@ -195,6 +195,12 @@ pub struct DeleteArgs {
     /// empty reason). Examples: "PII scrub — citizen surnames",
     /// "test fixtures left over from smoke run", "duplicate of #12345".
     pub reason: String,
+    /// Must be `true`. Asserts the human operator has explicitly approved
+    /// this delete call. The tool refuses if absent or false. Not a
+    /// formality — palace_delete is destructive and irreversible from
+    /// the live palace; only the WAL preserves payloads (vectors are
+    /// not recoverable).
+    pub confirm: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -339,7 +345,7 @@ impl Palace {
     }
 
     #[tool(
-        description = "Hard-delete one or more points by ID. Use this for true removal (PII scrubs, test garbage, mistakes) — for fact corrections that should leave a visible audit trail, prefer palace_supersede (soft-delete). Each delete is WAL-logged BEFORE the Qdrant call with the point's full payload and your reason, so the WAL is a recoverable audit even though the live point is gone. Missing IDs are idempotent: deleting a non-existent ID returns ok:true, missing:true. Cap: 100 IDs per call."
+        description = "DESTRUCTIVE — hard-deletes points from the palace by ID. **You MUST get the human operator's explicit approval before EVERY palace_delete call, regardless of batch size.** Once called the live points are gone; only the WAL preserves payloads (vectors are NOT recoverable). For fact corrections always prefer palace_supersede (soft-delete with full audit trail). Use this only for true removal: PII scrubs, garbage / test data, accidental writes the operator explicitly wants gone. The `confirm` flag MUST be true and the `reason` field MUST name the approval and why — e.g. \"Cali confirmed, PII scrub\". Missing IDs idempotent; cap 100 IDs/call."
     )]
     async fn palace_delete(
         &self,
@@ -871,6 +877,11 @@ impl Palace {
     }
 
     async fn do_delete(&self, args: DeleteArgs) -> anyhow::Result<DeleteResult> {
+        if !args.confirm {
+            anyhow::bail!(
+                "confirm must be true — palace_delete requires explicit operator approval; this is destructive and irreversible (live points are gone; only the WAL preserves payloads, not vectors)"
+            );
+        }
         if args.reason.trim().is_empty() {
             anyhow::bail!("reason is empty — say why this delete is happening");
         }

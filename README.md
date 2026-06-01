@@ -41,7 +41,7 @@ Neither upstream is vendored. Both are linked above; please follow and star thei
 | `palace_taxonomy` | Flat facet dump of wing / room / hall / category counts. |
 | `palace_check_duplicate` | Probe whether candidate text already exists above the 0.95 cosine threshold. |
 | `palace_supersede` | Replace one or more existing memories with a corrected version. Marks the old points with `valid_until`, `superseded_by`, `superseded_reason`; default `palace_find` hides them. |
-| `palace_delete` | Hard-delete one or more points by ID. Required `reason` is WAL-logged before the Qdrant call. Use sparingly — `palace_supersede` is the audited soft-delete path. Cap: 100 IDs per call. |
+| `palace_delete` | **DESTRUCTIVE — hard-delete by ID.** Requires explicit operator approval; both `confirm: true` and a `reason` are required and WAL-logged before the Qdrant call. Use for PII scrubs / garbage / mistakes only — prefer `palace_supersede` for fact corrections. Vectors are NOT recoverable. Cap: 100 IDs per call. |
 | `palace_store_batch` | Bulk-ingest up to 256 memories in one call. Embeds the whole batch in one ONNX/Ollama inference pass and bulk-upserts to Qdrant in one HTTP call (~3-5× faster than N single-item calls). Per-item dedup against the live palace; result returns per-item status, IDs, and dedup hits. Designed for migrations and bulk imports. |
 | `palace_gain` | Token-savings report. Aggregates the per-tool gain log and returns a `Summary` of how many tokens of agent context this server saved versus a hand-coded SSH+curl+jq equivalent. Optional `since` (RFC3339) and `include_text` flags. |
 
@@ -53,6 +53,10 @@ Input caps: 32 KB per text body, 100 IDs per recall batch, 1–20 results per fi
 - `recency_half_life_days` (f64) — opt-in recency bias. When set, palazzo fetches up to 4× the requested limit from Qdrant (capped at 80), re-ranks each hit by `score × exp(-age_days / half_life)`, then returns the top `limit`. Omit or pass `0` for pure cosine. Typical values: `30` (aggressive), `90` (moderate), `365` (gentle — a year-old memory gets half its raw score).
 
 Both knobs work alongside the wing/category/room/hall filters — they compose.
+
+### Destructive operations
+
+`palace_delete` is the only tool that physically removes data. It requires both `confirm: true` and a `reason`, each call is WAL-logged before the Qdrant call, but vectors are not recoverable from the WAL. Configure your MCP client to require human approval for this tool — in Claude Code, set `palace_delete` to ask each time via `~/.claude/settings.json` or project settings. For any reversible change, use `palace_supersede` instead.
 
 ### Temporal validity (`palace_supersede`)
 
