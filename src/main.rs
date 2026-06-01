@@ -392,10 +392,16 @@ async fn ingest_handler(
                     totals.duplicates_returned += result.counts.duplicates_returned;
                     totals.skipped_duplicates += result.counts.skipped_duplicates;
                     totals.failed += result.counts.failed;
+                    let dedup_against: Vec<u64> = result
+                        .items
+                        .iter()
+                        .filter_map(|e| e.duplicate_of)
+                        .collect();
                     let line = serde_json::json!({
                         "chunk": chunk_idx,
                         "items_in_chunk": chunk_len,
                         "counts": result.counts,
+                        "dedup_against": dedup_against,
                         "running": totals,
                     });
                     yield Ok::<_, std::io::Error>(axum::body::Bytes::from(format!("{line}\n")));

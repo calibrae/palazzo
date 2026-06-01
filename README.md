@@ -193,13 +193,13 @@ Same backend as `palace_store_batch` — embed, dedup, WAL, upsert — but deliv
 The response is **streamed NDJSON** — one progress line per processed batch (default 256 items each), then a final `{"done": true, ...}` line:
 
 ```
-{"chunk":0,"items_in_chunk":256,"counts":{"stored":256,...},"running":{"stored":256,...}}
-{"chunk":1,"items_in_chunk":256,"counts":{...},"running":{"stored":512,...}}
-{"chunk":2,"items_in_chunk":88,"counts":{...},"running":{"stored":600,...}}
-{"done":true,"total":600,"counts":{"stored":600,"duplicates_returned":0,"skipped_duplicates":0,"failed":0}}
+{"chunk":0,"items_in_chunk":256,"counts":{"stored":256,...},"dedup_against":[],"running":{"stored":256,...}}
+{"chunk":1,"items_in_chunk":256,"counts":{...},"dedup_against":[1000001,1000002],"running":{"stored":512,...}}
+{"chunk":2,"items_in_chunk":88,"counts":{...},"dedup_against":[],"running":{"stored":600,...}}
+{"done":true,"total":600,"counts":{"stored":600,"duplicates_returned":2,"skipped_duplicates":0,"failed":0}}
 ```
 
-Use `curl -N` to disable client-side buffering and watch progress live. Errors during processing emit a `{"chunk":N,"error":"..."}` line and close the stream. Body parse failures still return `400` with a plain-text body before any streaming starts.
+Each per-chunk progress line carries a `dedup_against` array — the existing point IDs that the chunk's items matched (cosine ≥ 0.95 + exact text). Empty when no dedup hits; non-empty when `counts.duplicates_returned > 0`. Use this to distinguish "all items deduplicated against existing memories" from "nothing happened". Use `curl -N` to disable client-side buffering and watch progress live. Errors during processing emit a `{"chunk":N,"error":"..."}` line and close the stream. Body parse failures still return `400` with a plain-text body before any streaming starts.
 
 ### Export collection as NDJSON (`GET /export`)
 
