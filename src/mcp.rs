@@ -29,6 +29,8 @@ const MAX_RECALL_IDS: usize = 100;
 const MAX_SUPERSEDES: usize = 50;
 /// Cap on how many points can be deleted in one tool call.
 const MAX_DELETE_IDS: usize = 100;
+/// Cap on how many points can match a filter-based delete in one call.
+const MAX_FILTER_DELETE: usize = 1000;
 /// Cap on items per `palace_store_batch` call. At 32 KB/text * 256 items the upper bound
 /// is ~8 MB request payload — well under any sensible HTTP limit and tractable for the
 /// embedder in one batch. Bigger bulk loads should issue multiple calls.
@@ -204,6 +206,41 @@ pub struct DeleteArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteByFilterArgs {
+    /// Exact-match wing filter (free-text). At least one of wing/category/room/hall/since/until MUST be set — an empty filter is refused.
+    #[serde(default)]
+    pub wing: Option<String>,
+    /// Exact-match category filter (free-text).
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Exact-match room filter.
+    #[serde(default)]
+    pub room: Option<String>,
+    /// Exact-match hall filter (free-text).
+    #[serde(default)]
+    pub hall: Option<String>,
+    /// Inclusive lower bound on memory timestamp (RFC3339 second-precision UTC).
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Inclusive upper bound on memory timestamp (RFC3339 second-precision UTC).
+    #[serde(default)]
+    pub until: Option<String>,
+    /// Include memories with a past `valid_until` (i.e. superseded entries). Default false.
+    #[serde(default)]
+    pub include_superseded: bool,
+    /// Required. Short human explanation — WAL-logged on every deleted point.
+    pub reason: String,
+    /// MUST be `true`. Asserts the human operator has explicitly approved this filter delete. Hard gate; the tool refuses if absent or false. No serde default (caller must pass it).
+    pub confirm: bool,
+    /// When true, returns the matched count + a 10-point sample + per-wing / per-hall breakdown WITHOUT deleting anything. Use this FIRST to learn the count.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Required on real (non-dry-run) deletes. Must equal the actual matched count or the call is refused — guard against runaway filters. Omit or set to None on dry_run.
+    #[serde(default)]
+    pub expected_count: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CheckDuplicateArgs {
     /// Candidate text. Returns the closest existing memory and whether it's above the duplicate threshold (0.95).
     pub text: String,
@@ -354,6 +391,18 @@ impl Palace {
         let started = Instant::now();
         let res = self.do_delete(args).await;
         self.finish_tool("palace_delete", started, res)
+    }
+
+    #[tool(
+        description = "MASS-DESTRUCTIVE — hard-deletes ALL points matching a filter. **You MUST get the human operator's explicit approval before EVERY call, naming the filter scope.** Use `dry_run: true` first to learn the matched count, the per-wing/per-hall breakdown, and a 10-point sample; then re-call with `dry_run: false`, the same filter, and `expected_count` set to the count from the dry run — the tool refuses on mismatch (your safety against the count changing between calls or a misjudged filter). `confirm: true` is required and `reason` MUST name the approval. WAL-logs every deleted point with its full payload BEFORE the Qdrant call; vectors are NOT recoverable. Cap: 1000 matching points per call — larger filters must be split, or use the Qdrant dashboard. Use palace_delete for known IDs; palace_supersede for fact corrections."
+    )]
+    async fn palace_delete_by_filter(
+        &self,
+        Parameters(args): Parameters<DeleteByFilterArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let res = self.do_delete_by_filter(args).await;
+        self.finish_tool("palace_delete_by_filter", started, res)
     }
 
     #[tool(
@@ -959,6 +1008,171 @@ impl Palace {
         })
     }
 
+    async fn do_delete_by_filter(
+        &self,
+        args: DeleteByFilterArgs,
+    ) -> anyhow::Result<DeleteByFilterResult> {
+        if !args.confirm {
+            anyhow::bail!(
+                "confirm must be true — palace_delete_by_filter requires explicit operator approval; this is mass-destructive and irreversible (only the WAL preserves payloads, not vectors)"
+            );
+        }
+        if args.reason.trim().is_empty() {
+            anyhow::bail!("reason is empty — say why this filter delete is happening");
+        }
+
+        // Validate filter is not empty: at least one of wing/category/room/hall/since/until must be set
+        if args.wing.is_none()
+            && args.category.is_none()
+            && args.room.is_none()
+            && args.hall.is_none()
+            && args.since.is_none()
+            && args.until.is_none()
+        {
+            anyhow::bail!(
+                "filter is empty — at least one of wing/category/room/hall/since/until must be set"
+            );
+        }
+
+        // Validate and parse RFC3339 timestamps
+        for (name, val) in [("since", &args.since), ("until", &args.until)] {
+            if let Some(s) = val
+                && crate::util::parse_rfc3339(s).is_none()
+            {
+                anyhow::bail!(
+                    "{name} must be RFC3339 second-precision UTC (e.g. 2026-04-20T00:00:00Z), got {s:?}"
+                );
+            }
+        }
+
+        // Build FindFilter with trimmed values
+        let filter = FindFilter {
+            wing: args.wing.map(|w| w.trim().to_string()),
+            category: args.category.map(|c| c.trim().to_string()),
+            room: args.room.map(|r| r.trim().to_string()),
+            hall: args.hall.map(|h| h.trim().to_string()),
+            since: args.since,
+            until: args.until,
+            exclude_superseded_before: if args.include_superseded {
+                None
+            } else {
+                Some(now_rfc3339())
+            },
+        };
+
+        // Enumerate matches via scroll, capped at MAX_FILTER_DELETE + 1
+        const SCROLL_PAGE_SIZE: usize = 256;
+        let mut all_matches = Vec::new();
+        let mut offset = None;
+        loop {
+            let (page, next_offset) = self
+                .qdrant
+                .scroll(SCROLL_PAGE_SIZE, offset, &filter, false)
+                .await?;
+            for point in page {
+                all_matches.push(point);
+                if all_matches.len() > MAX_FILTER_DELETE {
+                    // Stop collecting once we're sure there are too many
+                    break;
+                }
+            }
+            if all_matches.len() > MAX_FILTER_DELETE {
+                break;
+            }
+            if let Some(next) = next_offset {
+                offset = Some(next);
+            } else {
+                break;
+            }
+        }
+
+        let matched_count = all_matches.len() as u64;
+        if matched_count > MAX_FILTER_DELETE as u64 {
+            anyhow::bail!(
+                "filter matches {matched_count}+ points (max {MAX_FILTER_DELETE} per call). Split the filter (e.g. add a `since`/`until` window) or use the Qdrant dashboard."
+            );
+        }
+
+        // Compute per-wing and per-hall breakdowns
+        let mut breakdown_by_wing: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        let mut breakdown_by_hall: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        for point in &all_matches {
+            *breakdown_by_wing.entry(point.wing.clone()).or_insert(0) += 1;
+            *breakdown_by_hall.entry(point.hall.clone()).or_insert(0) += 1;
+        }
+
+        // Sample: first 10 points
+        let sample: Vec<DeleteByFilterSample> = all_matches
+            .iter()
+            .take(10)
+            .map(|point| DeleteByFilterSample {
+                id: point.id,
+                wing: point.wing.clone(),
+                room: point.room.clone(),
+                hall: point.hall.clone(),
+                text_preview: preview(&point.text),
+            })
+            .collect();
+
+        if args.dry_run {
+            // Dry run: no deletion, no WAL logging
+            return Ok(DeleteByFilterResult {
+                dry_run: true,
+                matched_count,
+                deleted_count: 0,
+                sample,
+                breakdown_by_wing,
+                breakdown_by_hall,
+                reason: args.reason,
+            });
+        }
+
+        // Real delete: require expected_count and validate it matches
+        let expected = args.expected_count.ok_or_else(|| {
+            anyhow::anyhow!(
+                "expected_count is required on a non-dry-run delete; first call with dry_run:true to learn the matched count, then pass that count here"
+            )
+        })?;
+
+        if expected != matched_count {
+            anyhow::bail!(
+                "filter matches {matched_count} points, but expected_count was {expected}; refusing to delete. Re-run with dry_run:true to recount."
+            );
+        }
+
+        // WAL-log each point before deleting
+        for point in &all_matches {
+            self.wal.log(
+                "palace_delete_by_filter",
+                &json!({
+                    "id": point.id,
+                    "wing": point.wing,
+                    "room": point.room,
+                    "hall": point.hall,
+                    "category": point.category,
+                    "text_preview": preview(&point.text),
+                    "session": point.session,
+                    "reason": args.reason,
+                }),
+            );
+        }
+
+        // Delete all matching points via filter
+        self.qdrant.delete_by_filter(&filter).await?;
+
+        Ok(DeleteByFilterResult {
+            dry_run: false,
+            matched_count,
+            deleted_count: matched_count,
+            sample: Vec::new(),
+            breakdown_by_wing,
+            breakdown_by_hall,
+            reason: args.reason,
+        })
+    }
+
     async fn do_recall(&self, args: RecallArgs) -> anyhow::Result<Vec<Memory>> {
         if args.ids.len() > MAX_RECALL_IDS {
             anyhow::bail!("too many ids: {} (max {MAX_RECALL_IDS})", args.ids.len());
@@ -1064,6 +1278,26 @@ struct SupersededEntry {
 }
 
 #[derive(Debug, Serialize)]
+struct DeleteByFilterResult {
+    dry_run: bool,
+    matched_count: u64,
+    deleted_count: u64,
+    sample: Vec<DeleteByFilterSample>,
+    breakdown_by_wing: std::collections::HashMap<String, u32>,
+    breakdown_by_hall: std::collections::HashMap<String, u32>,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteByFilterSample {
+    id: u64,
+    wing: String,
+    room: String,
+    hall: String,
+    text_preview: String,
+}
+
+#[derive(Debug, Serialize)]
 struct DeleteResult {
     deleted: Vec<DeleteEntry>,
     counts: DeleteCounts,
@@ -1106,8 +1340,8 @@ impl ServerHandler for Palace {
              Every memory is filed under four free-text labels — category, wing, room, hall — \
              organise them however suits you. Conventionally wing is one of projects/infrastructure/personal/career/vibe \
              and hall is one of facts/events/decisions/discoveries/preferences, but any value is accepted. \
-             Tools: palace_store, palace_store_batch, palace_find, palace_recall, palace_status, palace_taxonomy, palace_check_duplicate, palace_supersede, palace_delete, palace_gain. \
-             Hard-delete via palace_delete is reserved for PII scrubs / garbage / mistakes; for fact corrections that should leave a visible audit trail, prefer palace_supersede. \
+             Tools: palace_store, palace_store_batch, palace_find, palace_recall, palace_status, palace_taxonomy, palace_check_duplicate, palace_supersede, palace_delete, palace_delete_by_filter, palace_gain. \
+             Hard-delete via palace_delete is reserved for known IDs (PII scrubs / garbage / mistakes); for filter-based mass deletion use palace_delete_by_filter with dry_run:true first to learn the count. For fact corrections that should leave a visible audit trail, prefer palace_supersede. \
              For bulk migrations of pre-existing data (>~10K tokens of payload), prefer the sibling REST endpoint POST /ingest on the same host:port \
              (Content-Type: application/x-ndjson, body = JSONL of palace_store items). Invoke via Bash(curl --data-binary @file) — the bytes flow through curl's body and never enter the MCP transcript, \
              unlike palace_store_batch tool args which do. Same backend (embed, dedup, WAL, upsert), zero context cost for the payload. \

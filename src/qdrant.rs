@@ -233,6 +233,48 @@ impl Qdrant {
         Ok(())
     }
 
+    /// Hard-delete all points matching a filter.
+    ///
+    /// Refuses an empty filter — every user-facing constraint field
+    /// (`wing` / `category` / `room` / `hall` / `since` / `until`) being
+    /// `None` would nuke the collection (or wipe every current-truth
+    /// memory once `exclude_superseded_before` is applied). The MCP layer
+    /// validates too; this is defense-in-depth.
+    pub async fn delete_by_filter(&self, filter: &FindFilter) -> Result<()> {
+        let any_user_constraint = filter.wing.is_some()
+            || filter.category.is_some()
+            || filter.room.is_some()
+            || filter.hall.is_some()
+            || filter.since.is_some()
+            || filter.until.is_some();
+        if !any_user_constraint {
+            return Err(anyhow!(
+                "qdrant delete_by_filter: refusing empty filter (would delete the whole collection)"
+            ));
+        }
+        let qfilter = filter.to_qdrant_filter().ok_or_else(|| {
+            anyhow!("qdrant delete_by_filter: filter resolved to empty after construction")
+        })?;
+        let t0 = std::time::Instant::now();
+        let url = self.url("/points/delete?wait=true");
+        let body = json!({ "filter": qfilter });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("qdrant delete_by_filter: {status} {text}"));
+        }
+        metrics::histogram!("palazzo_qdrant_duration_seconds", "op" => "delete_by_filter")
+            .record(t0.elapsed().as_secs_f64());
+        Ok(())
+    }
+
     pub async fn search(
         &self,
         vector: Vec<f32>,
