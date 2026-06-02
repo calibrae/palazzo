@@ -7,6 +7,10 @@
   &nbsp;palazzo
 </h1>
 
+<p align="center">
+  Canonical upstream: <a href="https://github.com/calibrae/palazzo"><strong>github.com/calibrae/palazzo</strong></a>
+</p>
+
 MCP server exposing a Qdrant-backed memory palace — typed wings, rooms, and halls instead of a generic blob store.
 
 Cali's Rust daemon. Stdio or Streamable HTTP. No web UI, no auth, no drama.
