@@ -11,6 +11,9 @@
   Canonical upstream: <a href="https://github.com/calibrae/palazzo"><strong>github.com/calibrae/palazzo</strong></a>
 </p>
 
+> [!WARNING]
+> **palazzo ships with NO authentication and NO TLS.** Anyone who can reach the HTTP port can read, store, supersede, and **hard-delete** anything in the palace. Bind to `127.0.0.1` (the default) for single-user setups, or put it behind a reverse proxy with TLS + auth (nginx, Caddy, an identity-aware proxy) **before** exposing the port anywhere off-host. Never expose `palazzo serve` directly to the public internet. `PALAZZO_ALLOWED_HOSTS` is a DNS-rebinding guard, *not* auth — don't mistake it for one.
+
 MCP server exposing a Qdrant-backed memory palace — typed wings, rooms, and halls instead of a generic blob store.
 
 Cali's Rust daemon. Stdio or Streamable HTTP. No web UI, no auth, no drama.
