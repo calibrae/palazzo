@@ -225,7 +225,11 @@ palazzo ingest --json < batch.jsonl
 
 Same backend as `palace_store_batch` — embedding, dedup, WAL, upsert — but the texts never round-trip through the MCP transcript. Use this from migration scripts when the agent context can't afford the per-call cost of carrying the payloads. Input is JSON-Lines (`{"text":..., "category":..., "wing":..., "room":..., "hall":...}` per line, blank/`#`-prefixed lines ignored). Items are chunked into `MAX_STORE_BATCH` (256) groups and processed sequentially. Default output is a one-line summary on stderr; `--json` emits the full per-item result on stdout.
 
-#### Deploy as a systemd service
+## Deploy
+
+palazzo is a single binary; two supported paths to put it on a host.
+
+### Deploy as a systemd service
 
 The `deploy/` directory contains a hardened systemd unit, an env-file template, and an installer. On Debian / Ubuntu / any systemd host:
 
@@ -240,21 +244,54 @@ The unit runs as a dedicated `palazzo` user, drops all needless privileges (`Pro
 
 If you expose the service beyond a trusted LAN, put a reverse proxy with TLS + auth (e.g. nginx + basic auth, or an identity-aware proxy) in front of `:6334`. There is no built-in authentication — palazzo assumes a trusted network.
 
-#### Deploy with Docker Compose
+Pre-built release binaries are published on each tag at <https://github.com/calibrae/palazzo/releases>. The `palazzo-fastembed-<version>-x86_64-unknown-linux-gnu.tar.gz` artifact is the production target (glibc ≥ 2.38).
 
-`Dockerfile` + `docker-compose.yml` at the repo root deploy the whole stack — palazzo plus, optionally, a bundled Qdrant and/or Ollama:
+### Deploy with Docker Compose
+
+`Dockerfile` + `docker-compose.yml` at the repo root deploy the whole stack — palazzo plus, optionally, a bundled Qdrant and/or Ollama. The runtime image is Debian trixie (glibc 2.41); fastembed's ONNX prebuilts need glibc ≥ 2.38.
+
+**Quick start** — fully self-contained (fastembed + bundled Qdrant, zero external dependencies):
 
 ```
-cp .env.example .env          # pick backend + which services to bundle
+git clone https://github.com/calibrae/palazzo && cd palazzo
+cp .env.example .env             # default: COMPOSE_PROFILES=qdrant
 docker compose up -d --build
+curl http://localhost:6334/health
 ```
 
-Two axes, both driven by `.env`:
+Then register the MCP endpoint with your client (Claude Code shown):
 
-- **Embedding backend** — `PALAZZO_BACKEND=fastembed` (local ONNX, default) or `ollama` (HTTP to an Ollama server). Baked into the image at build time via the `BACKEND` build arg.
-- **Bundled services** — add `qdrant` to `COMPOSE_PROFILES` to run a Qdrant container, or omit it and point `QDRANT_URL` at an existing instance. An optional `ollama` profile bundles Ollama the same way.
+```
+claude mcp add --transport http palazzo http://<host>:6334/mcp
+```
 
-`COMPOSE_PROFILES=qdrant` gives a fully self-contained box (fastembed + Qdrant, zero external dependencies); `COMPOSE_PROFILES=` with `QDRANT_URL` set runs palazzo alone against your existing Qdrant. The WAL, fastembed model cache and usage log persist in the `palazzo-data` volume. palazzo tolerates Qdrant being unreachable at boot, so start order is not constrained.
+**Three common shapes** — pick one in `.env`:
+
+| Want | `.env` settings |
+|---|---|
+| Self-contained (default) | `PALAZZO_BACKEND=fastembed` · `COMPOSE_PROFILES=qdrant` |
+| Against an existing Qdrant | `PALAZZO_BACKEND=fastembed` · `COMPOSE_PROFILES=` · `QDRANT_URL=http://your-qdrant:6333` |
+| Ollama backend, bundled | `PALAZZO_BACKEND=ollama` · `COMPOSE_PROFILES=qdrant,ollama` · then `docker compose exec ollama ollama pull nomic-embed-text` |
+
+**Two axes**, both driven by `.env`:
+
+- **Embedding backend** — `PALAZZO_BACKEND=fastembed` (local ONNX, default) or `ollama` (HTTP to an Ollama server). **Baked into the image at build time** via the `BACKEND` build arg — switching backends requires `docker compose build`.
+- **Bundled services** — `COMPOSE_PROFILES` activates the `qdrant` and/or `ollama` containers. Omit a profile to point at an external service via its `*_URL` instead.
+
+**Persistence** — three named volumes survive `docker compose down`; only `docker compose down -v` wipes them:
+
+- `palazzo-data` — WAL (`wal.jsonl`), fastembed model cache, usage log.
+- `qdrant-data` — Qdrant storage (only when the `qdrant` profile is active).
+- `ollama-data` — Ollama model cache (only when the `ollama` profile is active).
+
+**Updating to a new palazzo release**:
+
+```
+git pull
+docker compose up -d --build       # rebuilds the image, restarts the service
+```
+
+palazzo tolerates Qdrant being unreachable at boot, so container start order is not constrained. The container binds `0.0.0.0:6334` internally and publishes to the host port `PALAZZO_PORT` (default `6334`) — change it in `.env` if that port is taken on the host.
 
 ## Testing
 
