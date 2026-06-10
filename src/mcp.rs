@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context as _;
 use mcp_gain::Tracker;
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -430,6 +431,17 @@ impl Palace {
     }
 }
 
+/// Filter for duplicate checks: only current-truth memories count. A superseded
+/// point must NOT swallow a re-store of the same text — it is hidden from
+/// default `palace_find`, so short-circuiting on it would make the "stored"
+/// memory invisible.
+fn dedup_filter() -> FindFilter {
+    FindFilter {
+        exclude_superseded_before: Some(now_rfc3339()),
+        ..FindFilter::default()
+    }
+}
+
 impl Palace {
     async fn do_store(&self, args: StoreArgs) -> anyhow::Result<StoreResult> {
         if args.text.len() > MAX_TEXT_BYTES {
@@ -449,10 +461,7 @@ impl Palace {
         let vec = self.embedder.embed(&args.text).await?;
 
         // Duplicate check — if the top hit is above threshold, skip the write and return the existing ID.
-        let existing = self
-            .qdrant
-            .search(vec.clone(), 1, &FindFilter::default())
-            .await?;
+        let existing = self.qdrant.search(vec.clone(), 1, &dedup_filter()).await?;
         if let Some(top) = existing.first()
             && top.score.unwrap_or(0.0) >= DUPLICATE_THRESHOLD
             && top.text == args.text
@@ -577,13 +586,10 @@ impl Palace {
         // search per item) and correct, but does serialize. For a batch of 256
         // that's ~256 ms total round-trip on localhost Qdrant — acceptable.
         let mut dedup_status: Vec<DedupStatus> = vec![DedupStatus::Fresh; n];
+        let dedup = dedup_filter();
         for (slot, &idx) in valid_indexes.iter().enumerate() {
             let vec_for_search = vectors[slot].clone();
-            let hits = match self
-                .qdrant
-                .search(vec_for_search, 1, &FindFilter::default())
-                .await
-            {
+            let hits = match self.qdrant.search(vec_for_search, 1, &dedup).await {
                 Ok(h) => h,
                 Err(e) => {
                     item_errors[idx] = Some(format!("dedup search: {e:#}"));
@@ -619,7 +625,7 @@ impl Palace {
                 continue;
             }
             let item = &args.items[idx];
-            let id = new_id_for_index(slot);
+            let id = new_id();
             let payload = Payload {
                 category: item.category.trim().to_string(),
                 wing: item.wing.trim().to_string(),
@@ -952,20 +958,23 @@ impl Palace {
 
         for id in &args.ids {
             if let Some(mem) = retrieved_map.remove(id) {
-                // WAL-log this deletion before we call Qdrant.
-                self.wal.log(
-                    "palace_delete",
-                    &json!({
-                        "id": id,
-                        "wing": mem.wing,
-                        "room": mem.room,
-                        "hall": mem.hall,
-                        "category": mem.category,
-                        "text_preview": preview(&mem.text),
-                        "session": mem.session,
-                        "reason": args.reason,
-                    }),
-                );
+                // WAL-log this deletion before we call Qdrant. Strict: the WAL
+                // is the only audit trail, so an unloggable delete is refused.
+                self.wal
+                    .log_strict(
+                        "palace_delete",
+                        &json!({
+                            "id": id,
+                            "wing": mem.wing,
+                            "room": mem.room,
+                            "hall": mem.hall,
+                            "category": mem.category,
+                            "text_preview": preview(&mem.text),
+                            "session": mem.session,
+                            "reason": args.reason,
+                        }),
+                    )
+                    .context("WAL append failed — refusing to delete without an audit trail")?;
                 counts.deleted += 1;
                 deleted_entries.push(DeleteEntry {
                     id: *id,
@@ -1142,25 +1151,32 @@ impl Palace {
             );
         }
 
-        // WAL-log each point before deleting
+        // WAL-log each point before deleting. Strict: the WAL is the only
+        // audit trail, so an unloggable delete is refused before any removal.
         for point in &all_matches {
-            self.wal.log(
-                "palace_delete_by_filter",
-                &json!({
-                    "id": point.id,
-                    "wing": point.wing,
-                    "room": point.room,
-                    "hall": point.hall,
-                    "category": point.category,
-                    "text_preview": preview(&point.text),
-                    "session": point.session,
-                    "reason": args.reason,
-                }),
-            );
+            self.wal
+                .log_strict(
+                    "palace_delete_by_filter",
+                    &json!({
+                        "id": point.id,
+                        "wing": point.wing,
+                        "room": point.room,
+                        "hall": point.hall,
+                        "category": point.category,
+                        "text_preview": preview(&point.text),
+                        "session": point.session,
+                        "reason": args.reason,
+                    }),
+                )
+                .context("WAL append failed — refusing to delete without an audit trail")?;
         }
 
-        // Delete all matching points via filter
-        self.qdrant.delete_by_filter(&filter).await?;
+        // Delete the exact IDs we enumerated and WAL-logged — NOT a re-run of
+        // the filter. Deleting by filter again would race against points
+        // stored between the scroll above and the delete, destroying them
+        // without a WAL entry.
+        let ids: Vec<u64> = all_matches.iter().map(|p| p.id).collect();
+        self.qdrant.delete(&ids).await?;
 
         Ok(DeleteByFilterResult {
             dry_run: false,
@@ -1212,7 +1228,7 @@ impl Palace {
         args: CheckDuplicateArgs,
     ) -> anyhow::Result<serde_json::Value> {
         let vec = self.embedder.embed(&args.text).await?;
-        let hits = self.qdrant.search(vec, 1, &FindFilter::default()).await?;
+        let hits = self.qdrant.search(vec, 1, &dedup_filter()).await?;
         let top = hits.into_iter().next();
         let is_duplicate = top
             .as_ref()
@@ -1352,20 +1368,26 @@ impl ServerHandler for Palace {
     }
 }
 
+/// Highest ID handed out by this process. `new_id` advances it atomically so
+/// concurrent calls (parallel MCP sessions, a store landing inside a batch)
+/// can never mint the same ID — a collision would silently overwrite the
+/// earlier point on upsert.
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn new_id() -> u64 {
+    use std::sync::atomic::Ordering;
     // Unix millis, guaranteed above the 1_000_000_000 floor.
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0) as u64;
-    millis.max(1_000_000_000)
-}
-
-/// Stable, collision-free IDs for a single `palace_store_batch` call. The
-/// per-item index is added on top of the millis floor so a 256-item batch
-/// can complete inside a single millisecond without two items sharing an ID.
-fn new_id_for_index(slot: usize) -> u64 {
-    new_id().saturating_add(slot as u64)
+    let floor = millis.max(1_000_000_000);
+    let prev = NEXT_ID
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |p| {
+            Some(p.saturating_add(1).max(floor))
+        })
+        .expect("fetch_update closure always returns Some");
+    prev.saturating_add(1).max(floor)
 }
 
 #[derive(Debug, Clone)]
@@ -1467,4 +1489,674 @@ fn preview(s: &str) -> String {
     }
     let truncated: String = s.chars().take(MAX).collect();
     format!("{truncated}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testmock::MockQdrant;
+    use std::path::PathBuf;
+
+    // ---------- helpers ----------
+
+    fn test_palace(url: &str, wal_path: Option<PathBuf>) -> Palace {
+        let tracker = Tracker::new(
+            std::env::temp_dir().join(format!("palazzo-test-usage-{}.jsonl", std::process::id())),
+            false,
+            crate::baselines::BASELINES,
+        );
+        Palace::new(
+            Embedder::fake(),
+            Qdrant::new(url, "test"),
+            Wal::with_path(wal_path),
+            tracker,
+        )
+    }
+
+    fn temp_wal(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "palazzo-mcp-test-wal-{tag}-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn payload_json(text: &str) -> serde_json::Value {
+        json!({
+            "category": "technical", "wing": "projects", "room": "palazzo",
+            "hall": "facts", "text": text, "timestamp": "2026-04-20T00:00:00Z",
+        })
+    }
+
+    fn delete_args(ids: Vec<u64>) -> DeleteArgs {
+        DeleteArgs {
+            ids,
+            reason: "test cleanup".into(),
+            confirm: true,
+        }
+    }
+
+    fn dbf_args() -> DeleteByFilterArgs {
+        DeleteByFilterArgs {
+            wing: None,
+            category: None,
+            room: Some("palazzo".into()),
+            hall: None,
+            since: None,
+            until: None,
+            include_superseded: false,
+            reason: "test cleanup".into(),
+            confirm: true,
+            dry_run: false,
+            expected_count: None,
+        }
+    }
+
+    fn store_args(text: &str) -> StoreArgs {
+        StoreArgs {
+            text: text.into(),
+            category: "technical".into(),
+            wing: "projects".into(),
+            room: "palazzo".into(),
+            hall: "facts".into(),
+            session: None,
+            source_file: None,
+        }
+    }
+
+    fn find_args(query: &str) -> FindArgs {
+        FindArgs {
+            query: query.into(),
+            limit: None,
+            wing: None,
+            category: None,
+            room: None,
+            hall: None,
+            since: None,
+            until: None,
+            recency_half_life_days: None,
+            include_superseded: None,
+        }
+    }
+
+    // ---------- pure helpers ----------
+
+    #[test]
+    fn new_id_strictly_increases() {
+        let mut prev = 0;
+        for _ in 0..10_000 {
+            let id = new_id();
+            assert!(id > prev, "id {id} not above previous {prev}");
+            assert!(id >= 1_000_000_000);
+            prev = id;
+        }
+    }
+
+    #[test]
+    fn new_id_unique_across_threads() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| (0..1_000).map(|_| new_id()).collect::<Vec<u64>>()))
+            .collect();
+        let mut all: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "duplicate IDs minted under concurrency");
+    }
+
+    #[test]
+    fn validate_tag_trims_and_bounds() {
+        assert_eq!(validate_tag("wing", "  facts  ").unwrap(), "facts");
+        assert!(validate_tag("wing", "   ").is_err());
+        assert!(validate_tag("wing", "").is_err());
+        assert!(validate_tag("wing", &"x".repeat(MAX_TAG_BYTES + 1)).is_err());
+        assert_eq!(
+            validate_tag("wing", &"x".repeat(MAX_TAG_BYTES)).unwrap(),
+            "x".repeat(MAX_TAG_BYTES)
+        );
+    }
+
+    #[test]
+    fn preview_truncates_on_char_boundary() {
+        assert_eq!(preview("short"), "short");
+        let long = "é".repeat(200);
+        let p = preview(&long);
+        assert_eq!(p.chars().count(), 121); // 120 + ellipsis
+        assert!(p.ends_with('…'));
+    }
+
+    #[test]
+    fn dedup_filter_excludes_superseded() {
+        let f = dedup_filter();
+        assert!(f.exclude_superseded_before.is_some());
+    }
+
+    // ---------- palace_delete ----------
+
+    #[tokio::test]
+    async fn delete_requires_confirm_and_reason_and_ids() {
+        let p = test_palace("http://127.0.0.1:9", None);
+        let err = p
+            .do_delete(DeleteArgs {
+                confirm: false,
+                ..delete_args(vec![1])
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("confirm"), "{err:#}");
+
+        let err = p
+            .do_delete(DeleteArgs {
+                reason: "  ".into(),
+                ..delete_args(vec![1])
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reason"), "{err:#}");
+
+        let err = p.do_delete(delete_args(vec![])).await.unwrap_err();
+        assert!(err.to_string().contains("nothing to delete"), "{err:#}");
+
+        let err = p
+            .do_delete(delete_args((0..=MAX_DELETE_IDS as u64).collect()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too many"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn delete_happy_path_wal_logs_then_deletes() {
+        let mock = MockQdrant::start().await;
+        mock.push(
+            "POST /points",
+            json!({"result": [
+                {"id": 1, "payload": payload_json("one")},
+                {"id": 2, "payload": payload_json("two")},
+            ]}),
+        );
+        let wal_path = temp_wal("delete-happy");
+        let p = test_palace(&mock.url, Some(wal_path.clone()));
+
+        let res = p.do_delete(delete_args(vec![1, 2, 3])).await.unwrap();
+        assert_eq!(res.counts.deleted, 2);
+        assert_eq!(res.counts.missing, 1);
+        assert_eq!(res.counts.failed, 0);
+
+        // Qdrant got one delete call with all three IDs.
+        let deletes = mock.requests_for("POST /points/delete");
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0]["points"], json!([1, 2, 3]));
+
+        // WAL has exactly the two existing points, logged with the reason.
+        let wal = std::fs::read_to_string(&wal_path).unwrap();
+        let lines: Vec<serde_json::Value> = wal
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["operation"], "palace_delete");
+        assert_eq!(lines[0]["params"]["reason"], "test cleanup");
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn delete_aborts_before_qdrant_when_wal_unconfigured() {
+        let mock = MockQdrant::start().await;
+        mock.push(
+            "POST /points",
+            json!({"result": [{"id": 1, "payload": payload_json("one")}]}),
+        );
+        let p = test_palace(&mock.url, None); // no WAL → strict log must fail
+
+        let err = p.do_delete(delete_args(vec![1])).await.unwrap_err();
+        assert!(err.to_string().contains("audit trail"), "{err:#}");
+        // The delete call never reached Qdrant.
+        assert!(mock.requests_for("POST /points/delete").is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_qdrant_failure_marks_all_failed() {
+        let mock = MockQdrant::start().await;
+        mock.push(
+            "POST /points",
+            json!({"result": [{"id": 1, "payload": payload_json("one")}]}),
+        );
+        mock.push(
+            "POST /points/delete",
+            json!({"__status": 500, "__body": {"status": {"error": "boom"}}}),
+        );
+        let wal_path = temp_wal("delete-fail");
+        let p = test_palace(&mock.url, Some(wal_path.clone()));
+
+        let res = p.do_delete(delete_args(vec![1])).await.unwrap();
+        assert_eq!(res.counts.failed, 1);
+        assert_eq!(res.counts.deleted, 0);
+        assert!(!res.deleted[0].ok);
+        assert!(res.deleted[0].error.is_some());
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn delete_all_missing_is_idempotent_without_wal() {
+        let mock = MockQdrant::start().await;
+        // Default retrieve response is empty — nothing exists, nothing to WAL-log.
+        let p = test_palace(&mock.url, None);
+        let res = p.do_delete(delete_args(vec![98, 99])).await.unwrap();
+        assert_eq!(res.counts.missing, 2);
+        assert_eq!(res.counts.deleted, 0);
+        assert!(res.deleted.iter().all(|e| e.ok && e.missing));
+    }
+
+    // ---------- palace_delete_by_filter ----------
+
+    #[tokio::test]
+    async fn delete_by_filter_rejects_empty_filter_and_bad_dates() {
+        let p = test_palace("http://127.0.0.1:9", None);
+        let err = p
+            .do_delete_by_filter(DeleteByFilterArgs {
+                room: None,
+                ..dbf_args()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("filter is empty"), "{err:#}");
+
+        let err = p
+            .do_delete_by_filter(DeleteByFilterArgs {
+                since: Some("yesterday".into()),
+                ..dbf_args()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("RFC3339"), "{err:#}");
+
+        let err = p
+            .do_delete_by_filter(DeleteByFilterArgs {
+                confirm: false,
+                ..dbf_args()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("confirm"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn delete_by_filter_dry_run_counts_without_deleting() {
+        let mock = MockQdrant::start().await;
+        mock.push(
+            "POST /points/scroll",
+            json!({"result": {"points": [
+                {"id": 1, "payload": payload_json("a")},
+                {"id": 2, "payload": payload_json("b")},
+                {"id": 3, "payload": payload_json("c")},
+            ], "next_page_offset": null}}),
+        );
+        let p = test_palace(&mock.url, None); // dry run must not need a WAL
+
+        let res = p
+            .do_delete_by_filter(DeleteByFilterArgs {
+                dry_run: true,
+                ..dbf_args()
+            })
+            .await
+            .unwrap();
+        assert!(res.dry_run);
+        assert_eq!(res.matched_count, 3);
+        assert_eq!(res.deleted_count, 0);
+        assert_eq!(res.sample.len(), 3);
+        assert_eq!(res.breakdown_by_wing["projects"], 3);
+        assert!(mock.requests_for("POST /points/delete").is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_by_filter_follows_scroll_pagination() {
+        let mock = MockQdrant::start().await;
+        mock.push(
+            "POST /points/scroll",
+            json!({"result": {"points": [
+                {"id": 1, "payload": payload_json("a")},
+                {"id": 2, "payload": payload_json("b")},
+            ], "next_page_offset": 99}}),
+        );
+        mock.push(
+            "POST /points/scroll",
+            json!({"result": {"points": [
+                {"id": 3, "payload": payload_json("c")},
+            ], "next_page_offset": null}}),
+        );
+        let p = test_palace(&mock.url, None);
+
+        let res = p
+            .do_delete_by_filter(DeleteByFilterArgs {
+                dry_run: true,
+                ..dbf_args()
+            })
+            .await
+            .unwrap();
+        assert_eq!(res.matched_count, 3);
+        let scrolls = mock.requests_for("POST /points/scroll");
+        assert_eq!(scrolls.len(), 2);
+        assert_eq!(scrolls[1]["offset"], 99); // second page resumed at the offset
+    }
+
+    #[tokio::test]
+    async fn delete_by_filter_requires_matching_expected_count() {
+        let mock = MockQdrant::start().await;
+        let page = json!({"result": {"points": [
+            {"id": 1, "payload": payload_json("a")},
+            {"id": 2, "payload": payload_json("b")},
+        ], "next_page_offset": null}});
+        mock.push("POST /points/scroll", page.clone());
+        mock.push("POST /points/scroll", page);
+        let p = test_palace(&mock.url, None);
+
+        // Missing expected_count on a real delete.
+        let err = p.do_delete_by_filter(dbf_args()).await.unwrap_err();
+        assert!(err.to_string().contains("expected_count"), "{err:#}");
+
+        // Mismatched expected_count.
+        let err = p
+            .do_delete_by_filter(DeleteByFilterArgs {
+                expected_count: Some(5),
+                ..dbf_args()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err:#}");
+        assert!(mock.requests_for("POST /points/delete").is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_by_filter_deletes_by_enumerated_ids_not_filter() {
+        let mock = MockQdrant::start().await;
+        mock.push(
+            "POST /points/scroll",
+            json!({"result": {"points": [
+                {"id": 10, "payload": payload_json("a")},
+                {"id": 11, "payload": payload_json("b")},
+            ], "next_page_offset": null}}),
+        );
+        let wal_path = temp_wal("dbf-happy");
+        let p = test_palace(&mock.url, Some(wal_path.clone()));
+
+        let res = p
+            .do_delete_by_filter(DeleteByFilterArgs {
+                expected_count: Some(2),
+                ..dbf_args()
+            })
+            .await
+            .unwrap();
+        assert_eq!(res.deleted_count, 2);
+
+        // The delete must target the exact WAL-logged IDs — never a filter,
+        // which would race against points stored after the scroll.
+        let deletes = mock.requests_for("POST /points/delete");
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0]["points"], json!([10, 11]));
+        assert!(deletes[0].get("filter").is_none());
+
+        let wal = std::fs::read_to_string(&wal_path).unwrap();
+        assert_eq!(wal.lines().count(), 2);
+        assert!(wal.contains("palace_delete_by_filter"));
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn delete_by_filter_aborts_when_wal_unconfigured() {
+        let mock = MockQdrant::start().await;
+        mock.push(
+            "POST /points/scroll",
+            json!({"result": {"points": [
+                {"id": 10, "payload": payload_json("a")},
+            ], "next_page_offset": null}}),
+        );
+        let p = test_palace(&mock.url, None);
+
+        let err = p
+            .do_delete_by_filter(DeleteByFilterArgs {
+                expected_count: Some(1),
+                ..dbf_args()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("audit trail"), "{err:#}");
+        assert!(mock.requests_for("POST /points/delete").is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_by_filter_enforces_cap() {
+        let mock = MockQdrant::start().await;
+        let points: Vec<serde_json::Value> = (0..=MAX_FILTER_DELETE as u64)
+            .map(|i| json!({"id": i + 1, "payload": payload_json("x")}))
+            .collect();
+        mock.push(
+            "POST /points/scroll",
+            json!({"result": {"points": points, "next_page_offset": null}}),
+        );
+        let p = test_palace(&mock.url, None);
+
+        let err = p
+            .do_delete_by_filter(DeleteByFilterArgs {
+                dry_run: true,
+                ..dbf_args()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("matches"), "{err:#}");
+        assert!(mock.requests_for("POST /points/delete").is_empty());
+    }
+
+    // ---------- validation that errors before any I/O ----------
+
+    #[tokio::test]
+    async fn store_rejects_empty_and_oversized_text() {
+        let p = test_palace("http://127.0.0.1:9", None);
+        let err = p.do_store(store_args("   ")).await.unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err:#}");
+
+        let err = p
+            .do_store(store_args(&"x".repeat(MAX_TEXT_BYTES + 1)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn find_rejects_bad_since() {
+        let p = test_palace("http://127.0.0.1:9", None);
+        let err = p
+            .do_find(FindArgs {
+                since: Some("last tuesday".into()),
+                ..find_args("query")
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("RFC3339"), "{err:#}");
+    }
+
+    // ---------- store / dedup / find — need real (fake) embeddings ----------
+
+    #[cfg(feature = "fastembed")]
+    mod with_embedder {
+        use super::*;
+
+        fn batch_item(text: &str) -> StoreBatchItem {
+            StoreBatchItem {
+                text: text.into(),
+                category: "technical".into(),
+                wing: "projects".into(),
+                room: "palazzo".into(),
+                hall: "facts".into(),
+                session: None,
+                source_file: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn store_duplicate_short_circuits_and_excludes_superseded() {
+            let mock = MockQdrant::start().await;
+            mock.push(
+                "POST /points/search",
+                json!({"result": [
+                    {"id": 42, "score": 0.99, "payload": payload_json("same text")},
+                ]}),
+            );
+            let p = test_palace(&mock.url, None);
+
+            let res = p.do_store(store_args("same text")).await.unwrap();
+            assert_eq!(res.id, 42);
+            assert_eq!(res.duplicate_of, Some(42));
+            // No write happened.
+            assert!(mock.requests_for("PUT /points").is_empty());
+
+            // The dedup search must hide superseded points (a superseded match
+            // would swallow the re-store and leave the memory invisible).
+            let searches = mock.requests_for("POST /points/search");
+            assert_eq!(searches[0]["filter"]["must_not"][0]["key"], "valid_until");
+        }
+
+        #[tokio::test]
+        async fn store_high_score_different_text_still_stores() {
+            let mock = MockQdrant::start().await;
+            mock.push(
+                "POST /points/search",
+                json!({"result": [
+                    {"id": 42, "score": 0.99, "payload": payload_json("other text")},
+                ]}),
+            );
+            let p = test_palace(&mock.url, None);
+
+            let res = p.do_store(store_args("same text")).await.unwrap();
+            assert!(res.id >= 1_000_000_000);
+            assert_eq!(res.duplicate_of, None);
+            let upserts = mock.requests_for("PUT /points");
+            assert_eq!(upserts.len(), 1);
+            assert_eq!(upserts[0]["points"][0]["payload"]["text"], "same text");
+        }
+
+        #[tokio::test]
+        async fn store_batch_mixed_outcomes() {
+            let mock = MockQdrant::start().await;
+            // Dedup searches run in item order over valid items: dup first, fresh second.
+            mock.push(
+                "POST /points/search",
+                json!({"result": [
+                    {"id": 42, "score": 0.99, "payload": payload_json("dup text")},
+                ]}),
+            );
+            mock.push("POST /points/search", json!({"result": []}));
+            let p = test_palace(&mock.url, None);
+
+            let res = p
+                .do_store_batch(StoreBatchArgs {
+                    items: vec![
+                        batch_item("   "), // invalid
+                        batch_item("dup text"),
+                        batch_item("fresh text"),
+                    ],
+                    skip_duplicates: None,
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(res.counts.failed, 1);
+            assert_eq!(res.counts.duplicates_returned, 1);
+            assert_eq!(res.counts.stored, 1);
+
+            assert!(!res.items[0].ok);
+            assert!(res.items[0].error.as_deref().unwrap().contains("empty"));
+            assert_eq!(res.items[1].duplicate_of, Some(42));
+            assert!(res.items[2].id.unwrap() >= 1_000_000_000);
+
+            // Exactly one upsert containing only the fresh item.
+            let upserts = mock.requests_for("PUT /points");
+            assert_eq!(upserts.len(), 1);
+            let points = upserts[0]["points"].as_array().unwrap();
+            assert_eq!(points.len(), 1);
+            assert_eq!(points[0]["payload"]["text"], "fresh text");
+        }
+
+        #[tokio::test]
+        async fn check_duplicate_reports_threshold_and_filters_superseded() {
+            let mock = MockQdrant::start().await;
+            mock.push(
+                "POST /points/search",
+                json!({"result": [
+                    {"id": 7, "score": 0.97, "payload": payload_json("close")},
+                ]}),
+            );
+            let p = test_palace(&mock.url, None);
+
+            let res = p
+                .do_check_duplicate(CheckDuplicateArgs {
+                    text: "candidate".into(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(res["is_duplicate"], true);
+            assert_eq!(res["closest"]["id"], 7);
+
+            let searches = mock.requests_for("POST /points/search");
+            assert_eq!(searches[0]["filter"]["must_not"][0]["key"], "valid_until");
+        }
+
+        #[tokio::test]
+        async fn find_hides_superseded_by_default_and_clamps_limit() {
+            let mock = MockQdrant::start().await;
+            let p = test_palace(&mock.url, None);
+
+            p.do_find(FindArgs {
+                limit: Some(50),
+                ..find_args("query")
+            })
+            .await
+            .unwrap();
+            let searches = mock.requests_for("POST /points/search");
+            assert_eq!(searches[0]["limit"], 20); // clamped
+            assert_eq!(searches[0]["filter"]["must_not"][0]["key"], "valid_until");
+
+            p.do_find(FindArgs {
+                include_superseded: Some(true),
+                ..find_args("query")
+            })
+            .await
+            .unwrap();
+            let searches = mock.requests_for("POST /points/search");
+            assert!(searches[1].get("filter").is_none());
+        }
+
+        #[tokio::test]
+        async fn find_recency_rerank_prefers_recent() {
+            let mock = MockQdrant::start().await;
+            let mut old = payload_json("old but cosine-closer");
+            old["timestamp"] = json!("2020-01-01T00:00:00Z");
+            let mut new = payload_json("recent");
+            new["timestamp"] = json!(now_rfc3339());
+            mock.push(
+                "POST /points/search",
+                json!({"result": [
+                    {"id": 1, "score": 0.9, "payload": old},
+                    {"id": 2, "score": 0.5, "payload": new},
+                ]}),
+            );
+            let p = test_palace(&mock.url, None);
+
+            let hits = p
+                .do_find(FindArgs {
+                    recency_half_life_days: Some(30.0),
+                    ..find_args("query")
+                })
+                .await
+                .unwrap();
+            assert_eq!(hits[0].id, 2, "recent point should outrank decayed one");
+
+            // With a half-life the fetch over-samples (limit*4, capped at 80).
+            let searches = mock.requests_for("POST /points/search");
+            assert_eq!(searches[0]["limit"], 20);
+        }
+    }
 }

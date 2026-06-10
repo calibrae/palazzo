@@ -42,6 +42,15 @@ impl Embedder {
         }
     }
 
+    /// Test-only embedder. Points at an unroutable address — tests that
+    /// actually embed are gated on the `fastembed` feature; this exists so
+    /// non-embedding tests (delete paths, validation) compile and run under
+    /// the `ollama` feature too.
+    #[cfg(test)]
+    pub fn fake() -> Self {
+        Self::new("http://127.0.0.1:9", "fake-model")
+    }
+
     /// Embed a single string. Tries `/api/embed` (Ollama ≥0.1.33) first,
     /// falls back to legacy `/api/embeddings` on 404.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {

@@ -3,6 +3,8 @@ mod embed;
 mod mcp;
 mod qdrant;
 mod schema;
+#[cfg(test)]
+mod testmock;
 mod util;
 mod wal;
 

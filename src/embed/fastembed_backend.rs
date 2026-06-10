@@ -30,10 +30,50 @@ use tokio::sync::Mutex;
 /// during the rebuild window, it just blocks on the lock for that single ms.
 #[derive(Clone)]
 pub struct Embedder {
-    inner: Arc<Mutex<TextEmbedding>>,
+    inner: Arc<Mutex<Inner>>,
     /// Unix-seconds timestamp of the last embed completion. Read by the
     /// background watcher to decide whether traffic is quiet.
     last_embed_at: Arc<AtomicU64>,
+}
+
+/// The actual embedding implementation behind the mutex. `Fake` exists only
+/// for unit tests — deterministic 768-dim vectors with no model download.
+/// (Variant size difference is irrelevant: exactly one `Inner` exists per
+/// process, behind an `Arc<Mutex<_>>`.)
+#[allow(clippy::large_enum_variant)]
+enum Inner {
+    Real(TextEmbedding),
+    #[cfg(test)]
+    Fake,
+}
+
+impl Inner {
+    fn embed(&mut self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>> {
+        match self {
+            Inner::Real(m) => m.embed(texts, None).map_err(|e| anyhow!("fastembed: {e}")),
+            #[cfg(test)]
+            Inner::Fake => Ok(texts.iter().map(|t| fake_vec(t)).collect()),
+        }
+    }
+}
+
+/// Deterministic pseudo-embedding: same text → same vector, different text →
+/// different vector. Not semantically meaningful — tests control similarity
+/// through canned Qdrant responses, not vector geometry.
+#[cfg(test)]
+fn fake_vec(text: &str) -> Vec<f32> {
+    let mut h: u32 = 2_166_136_261;
+    for b in text.bytes() {
+        h = (h ^ u32::from(b)).wrapping_mul(16_777_619);
+    }
+    (0..768)
+        .map(|i| {
+            h = h
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223 + i as u32);
+            (h as f32 / u32::MAX as f32) - 0.5
+        })
+        .collect()
 }
 
 /// Build a fresh `TextEmbedding`. Blocking — loads the model from the on-disk
@@ -73,7 +113,7 @@ impl Embedder {
     pub fn new() -> Result<Self> {
         let model = build_model()?;
         let me = Self {
-            inner: Arc::new(Mutex::new(model)),
+            inner: Arc::new(Mutex::new(Inner::Real(model))),
             last_embed_at: Arc::new(AtomicU64::new(now_secs())),
         };
 
@@ -100,6 +140,15 @@ impl Embedder {
         Ok(me)
     }
 
+    /// Test-only embedder: deterministic vectors, no model load, no watcher.
+    #[cfg(test)]
+    pub fn fake() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner::Fake)),
+            last_embed_at: Arc::new(AtomicU64::new(now_secs())),
+        }
+    }
+
     /// Embed a single string.
     ///
     /// ONNX inference is synchronous and CPU-bound — 50-200 ms+ per call. It
@@ -118,9 +167,7 @@ impl Embedder {
         let t0 = std::time::Instant::now();
         let out = tokio::task::spawn_blocking(move || {
             let mut guard = inner.blocking_lock();
-            let mut out = guard
-                .embed(vec![text.as_str()], None)
-                .map_err(|e| anyhow!("fastembed: {e}"))?;
+            let mut out = guard.embed(vec![text.as_str()])?;
             out.pop()
                 .ok_or_else(|| anyhow!("fastembed returned zero embeddings"))
         })
@@ -159,9 +206,7 @@ impl Embedder {
             let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
             for chunk in texts.chunks(chunk_size) {
                 let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-                let mut vecs = guard
-                    .embed(refs, None)
-                    .map_err(|e| anyhow!("fastembed batch: {e}"))?;
+                let mut vecs = guard.embed(refs).context("fastembed batch")?;
                 out.append(&mut vecs);
             }
             Ok(out)
@@ -228,7 +273,7 @@ impl Embedder {
                     Ok(Ok(fresh)) => {
                         {
                             let mut guard = inner.lock().await;
-                            *guard = fresh;
+                            *guard = Inner::Real(fresh);
                         }
                         let after = current_rss_mb().unwrap_or(0);
                         metrics::counter!("palazzo_embedder_recycles_total").increment(1);

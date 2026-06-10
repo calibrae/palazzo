@@ -233,48 +233,6 @@ impl Qdrant {
         Ok(())
     }
 
-    /// Hard-delete all points matching a filter.
-    ///
-    /// Refuses an empty filter — every user-facing constraint field
-    /// (`wing` / `category` / `room` / `hall` / `since` / `until`) being
-    /// `None` would nuke the collection (or wipe every current-truth
-    /// memory once `exclude_superseded_before` is applied). The MCP layer
-    /// validates too; this is defense-in-depth.
-    pub async fn delete_by_filter(&self, filter: &FindFilter) -> Result<()> {
-        let any_user_constraint = filter.wing.is_some()
-            || filter.category.is_some()
-            || filter.room.is_some()
-            || filter.hall.is_some()
-            || filter.since.is_some()
-            || filter.until.is_some();
-        if !any_user_constraint {
-            return Err(anyhow!(
-                "qdrant delete_by_filter: refusing empty filter (would delete the whole collection)"
-            ));
-        }
-        let qfilter = filter.to_qdrant_filter().ok_or_else(|| {
-            anyhow!("qdrant delete_by_filter: filter resolved to empty after construction")
-        })?;
-        let t0 = std::time::Instant::now();
-        let url = self.url("/points/delete?wait=true");
-        let body = json!({ "filter": qfilter });
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("qdrant delete_by_filter: {status} {text}"));
-        }
-        metrics::histogram!("palazzo_qdrant_duration_seconds", "op" => "delete_by_filter")
-            .record(t0.elapsed().as_secs_f64());
-        Ok(())
-    }
-
     pub async fn search(
         &self,
         vector: Vec<f32>,
@@ -528,4 +486,125 @@ fn to_export_point(p: ScrolledPoint) -> Option<ExportPoint> {
         superseded_reason: pl.superseded_reason,
         vector: p.vector,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FindFilter, Qdrant};
+    use crate::testmock::MockQdrant;
+    use serde_json::json;
+
+    #[test]
+    fn empty_filter_is_none() {
+        assert!(FindFilter::default().to_qdrant_filter().is_none());
+    }
+
+    #[test]
+    fn tag_filters_become_must_matches() {
+        let f = FindFilter {
+            wing: Some("projects".into()),
+            hall: Some("facts".into()),
+            ..FindFilter::default()
+        };
+        let q = f.to_qdrant_filter().unwrap();
+        let must = q["must"].as_array().unwrap();
+        assert_eq!(must.len(), 2);
+        assert!(must.contains(&json!({"key": "wing", "match": {"value": "projects"}})));
+        assert!(must.contains(&json!({"key": "hall", "match": {"value": "facts"}})));
+        assert!(q.get("must_not").is_none());
+    }
+
+    #[test]
+    fn since_until_become_timestamp_range() {
+        let f = FindFilter {
+            since: Some("2026-01-01T00:00:00Z".into()),
+            until: Some("2026-02-01T00:00:00Z".into()),
+            ..FindFilter::default()
+        };
+        let q = f.to_qdrant_filter().unwrap();
+        let must = q["must"].as_array().unwrap();
+        assert_eq!(must.len(), 1);
+        assert_eq!(must[0]["key"], "timestamp");
+        assert_eq!(must[0]["range"]["gte"], "2026-01-01T00:00:00Z");
+        assert_eq!(must[0]["range"]["lte"], "2026-02-01T00:00:00Z");
+    }
+
+    #[test]
+    fn exclude_superseded_becomes_must_not_valid_until() {
+        let f = FindFilter {
+            exclude_superseded_before: Some("2026-06-10T00:00:00Z".into()),
+            ..FindFilter::default()
+        };
+        let q = f.to_qdrant_filter().unwrap();
+        assert!(q.get("must").is_none());
+        let must_not = q["must_not"].as_array().unwrap();
+        assert_eq!(must_not.len(), 1);
+        assert_eq!(must_not[0]["key"], "valid_until");
+        assert_eq!(must_not[0]["range"]["lte"], "2026-06-10T00:00:00Z");
+    }
+
+    fn payload_json(text: &str) -> serde_json::Value {
+        json!({
+            "category": "technical", "wing": "projects", "room": "palazzo",
+            "hall": "facts", "text": text, "timestamp": "2026-04-20T00:00:00Z",
+        })
+    }
+
+    #[tokio::test]
+    async fn search_decodes_numeric_and_string_ids() {
+        let mock = MockQdrant::start().await;
+        mock.push(
+            "POST /points/search",
+            json!({"result": [
+                {"id": 7, "score": 0.9, "payload": payload_json("a")},
+                {"id": "12", "score": 0.8, "payload": payload_json("b")},
+                {"id": [1], "score": 0.7, "payload": payload_json("dropped — bad id")},
+            ]}),
+        );
+        let q = Qdrant::new(&mock.url, "test");
+        let hits = q
+            .search(vec![0.0; 768], 5, &FindFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, 7);
+        assert_eq!(hits[0].score, Some(0.9));
+        assert_eq!(hits[1].id, 12);
+    }
+
+    #[tokio::test]
+    async fn retrieve_skips_payloadless_points() {
+        let mock = MockQdrant::start().await;
+        mock.push(
+            "POST /points",
+            json!({"result": [
+                {"id": 1, "payload": payload_json("kept")},
+                {"id": 2},
+            ]}),
+        );
+        let q = Qdrant::new(&mock.url, "test");
+        let got = q.retrieve(vec![1, 2]).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, 1);
+        assert_eq!(got[0].text, "kept");
+    }
+
+    #[tokio::test]
+    async fn upsert_error_status_surfaces() {
+        let mock = MockQdrant::start().await;
+        mock.push(
+            "PUT /points",
+            json!({"__status": 500, "__body": {"status": {"error": "boom"}}}),
+        );
+        let q = Qdrant::new(&mock.url, "test");
+        let err = q
+            .upsert(
+                1,
+                vec![0.0; 768],
+                serde_json::from_value(payload_json("x")).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "{err:#}");
+    }
 }
