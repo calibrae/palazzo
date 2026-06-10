@@ -811,7 +811,9 @@ impl Palace {
                 let age = (now_secs - ts).max(0) as f64;
                 let decay = (-age / half_life_secs).exp() as f32;
                 if let Some(s) = m.score.as_mut() {
-                    *s *= decay;
+                    // Clamp at 0 first: multiplying a negative cosine by decay
+                    // would move it toward 0 — i.e. *boost* old bad matches.
+                    *s = s.max(0.0) * decay;
                 }
             }
             hits.sort_by(|a, b| {

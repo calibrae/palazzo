@@ -1,6 +1,6 @@
 [package]
 name = "palazzo"
-version = "0.12.1"
+version = "0.12.2"
 edition = "2024"
 description = "Self-contained Rust MCP memory palace — Qdrant + local fastembed, typed wing/room/hall schema, temporal supersede, token-savings analytics."
 repository = "https://github.com/calibrae/palazzo"
@@ -44,4 +44,6 @@ codegen-units = 1
 strip = true
 
 [patch.crates-io]
-rmcp = { git = "https://github.com/calibrae/rmcp", branch = "feat/auto-accept-sessions" }
+# Pinned to a rev (not the branch) so fresh lockfiles and `cargo update` can't
+# silently pick up new commits — feat/auto-accept-sessions head as of 2026-06-10.
+rmcp = { git = "https://github.com/calibrae/rmcp", rev = "fc7d3177e98075e6fb99e30533f9760477fb80e0" }

@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "palazzo"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2704,7 +2704,7 @@ dependencies = [
 [[package]]
 name = "rmcp"
 version = "1.7.0"
-source = "git+https://github.com/calibrae/rmcp?branch=feat%2Fauto-accept-sessions#fc7d3177e98075e6fb99e30533f9760477fb80e0"
+source = "git+https://github.com/calibrae/rmcp?rev=fc7d3177e98075e6fb99e30533f9760477fb80e0#fc7d3177e98075e6fb99e30533f9760477fb80e0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2734,7 +2734,7 @@ dependencies = [
 [[package]]
 name = "rmcp-macros"
 version = "1.7.0"
-source = "git+https://github.com/calibrae/rmcp?branch=feat%2Fauto-accept-sessions#fc7d3177e98075e6fb99e30533f9760477fb80e0"
+source = "git+https://github.com/calibrae/rmcp?rev=fc7d3177e98075e6fb99e30533f9760477fb80e0#fc7d3177e98075e6fb99e30533f9760477fb80e0"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",

@@ -90,13 +90,15 @@ fn build_model() -> Result<TextEmbedding> {
     TextEmbedding::try_new(init).context("initialise fastembed NomicEmbedTextV15")
 }
 
-/// Current process resident set size in MiB. Linux-only (reads `/proc/self/statm`);
-/// returns `None` elsewhere, which disables recycling on non-Linux dev boxes.
+/// Current process resident set size in MiB. Linux-only (reads the `VmRSS`
+/// line of `/proc/self/status`, which is already in kB — no page-size
+/// assumption, correct on 16K-page ARM kernels too). Returns `None` elsewhere,
+/// which disables recycling on non-Linux dev boxes.
 fn current_rss_mb() -> Option<u64> {
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-    let page_size = 4096u64; // Linux default; close enough for a threshold check.
-    Some(resident_pages * page_size / (1024 * 1024))
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / 1024)
 }
 
 fn now_secs() -> u64 {

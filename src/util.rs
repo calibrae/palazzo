@@ -52,7 +52,8 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
     let h = num(&b[11..13])? as u32;
     let mi = num(&b[14..16])? as u32;
     let se = num(&b[17..19])? as u32;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h >= 24 || mi >= 60 || se >= 60 {
+    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) || h >= 24 || mi >= 60 || se >= 60
+    {
         return None;
     }
     // Howard Hinnant's days_from_civil — inverse of the civil-from-days in format_rfc3339.
@@ -64,6 +65,18 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     Some(days * 86_400 + h as i64 * 3600 + mi as i64 * 60 + se as i64)
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +143,16 @@ mod tests {
         assert!(parse_rfc3339("2026-13-01T00:00:00Z").is_none());
         assert!(parse_rfc3339("2026-04-32T00:00:00Z").is_none());
         assert!(parse_rfc3339("2026-04-20T25:00:00Z").is_none());
+    }
+
+    #[test]
+    fn impossible_calendar_days() {
+        assert!(parse_rfc3339("2026-02-31T00:00:00Z").is_none());
+        assert!(parse_rfc3339("2026-02-29T00:00:00Z").is_none()); // 2026 not a leap year
+        assert!(parse_rfc3339("2024-02-29T00:00:00Z").is_some()); // 2024 is
+        assert!(parse_rfc3339("2100-02-29T00:00:00Z").is_none()); // century non-leap
+        assert!(parse_rfc3339("2000-02-29T00:00:00Z").is_some()); // 400-year leap
+        assert!(parse_rfc3339("2026-04-31T00:00:00Z").is_none()); // April has 30
+        assert!(parse_rfc3339("2026-04-00T00:00:00Z").is_none());
     }
 }

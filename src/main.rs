@@ -101,7 +101,7 @@ fn make_tracker() -> Tracker {
 }
 
 const BACKEND: &str = if cfg!(feature = "fastembed") {
-    "fastembed:NomicEmbedTextV15"
+    "fastembed:NomicEmbedTextV15Q"
 } else {
     "ollama"
 };
@@ -448,11 +448,13 @@ async fn health_handler(
     } else {
         "down"
     };
+    // The embedder is constructed before the listener binds, so reaching this
+    // handler implies it loaded; report the backend rather than a fake status.
     axum::Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "qdrant": qdrant,
-        "embedder": "ready",
+        "embedder": BACKEND,
     }))
 }
 
