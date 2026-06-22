@@ -142,6 +142,11 @@ pub struct FindArgs {
     /// Exact-match hall filter (free-text).
     #[serde(default)]
     pub hall: Option<String>,
+    /// Exact-match author filter — the email stamped at write time when auth is
+    /// enabled. Use this to pull everything a given user has stored. Matched
+    /// case-insensitively (authors are stored lowercased).
+    #[serde(default)]
+    pub author: Option<String>,
     /// Inclusive lower bound on memory timestamp (RFC3339 second-precision, e.g.
     /// "2026-04-01T00:00:00Z"). Memories older than this are excluded.
     #[serde(default)]
@@ -208,7 +213,7 @@ pub struct DeleteArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteByFilterArgs {
-    /// Exact-match wing filter (free-text). At least one of wing/category/room/hall/since/until MUST be set — an empty filter is refused.
+    /// Exact-match wing filter (free-text). At least one of wing/category/room/hall/author/since/until MUST be set — an empty filter is refused.
     #[serde(default)]
     pub wing: Option<String>,
     /// Exact-match category filter (free-text).
@@ -220,6 +225,10 @@ pub struct DeleteByFilterArgs {
     /// Exact-match hall filter (free-text).
     #[serde(default)]
     pub hall: Option<String>,
+    /// Exact-match author filter (email stamped at write time). Enables "erase
+    /// everything from user X" — e.g. a departed user or a GDPR request.
+    #[serde(default)]
+    pub author: Option<String>,
     /// Inclusive lower bound on memory timestamp (RFC3339 second-precision UTC).
     #[serde(default)]
     pub since: Option<String>,
@@ -331,7 +340,7 @@ impl Palace {
     }
 
     #[tool(
-        description = "Semantic search over the palace. Optional typed filters narrow the search before vector comparison: wing/category/room/hall for faceted filtering, since/until (RFC3339) for time-range filtering, recency_half_life_days to bias scores toward recent memories. By default, points that have been superseded by a newer memory (via palace_supersede) are hidden; pass include_superseded=true to surface them for archaeology."
+        description = "Semantic search over the palace. Optional typed filters narrow the search before vector comparison: wing/category/room/hall/author for faceted filtering (author = the email stamped at write time — use it to pull everything one user stored), since/until (RFC3339) for time-range filtering, recency_half_life_days to bias scores toward recent memories. By default, points that have been superseded by a newer memory (via palace_supersede) are hidden; pass include_superseded=true to surface them for archaeology."
     )]
     async fn palace_find(
         &self,
@@ -364,7 +373,7 @@ impl Palace {
     }
 
     #[tool(
-        description = "Faceted taxonomy: value → count for wing, room, hall, category. Same data as palace_status but flatter — good for dump-the-layout queries."
+        description = "Faceted taxonomy: value → count for wing, room, hall, category, and author. The author facet lists every contributor and how much each has stored. Same data as palace_status but flatter — good for dump-the-layout queries."
     )]
     async fn palace_taxonomy(&self) -> Result<CallToolResult, McpError> {
         let started = Instant::now();
@@ -799,6 +808,8 @@ impl Palace {
             category: args.category.map(|c| c.trim().to_string()),
             room: args.room.map(|r| r.trim().to_string()),
             hall: args.hall.map(|h| h.trim().to_string()),
+            // Authors are stored lowercased — match the same way.
+            author: args.author.map(|a| a.trim().to_lowercase()),
             since: args.since,
             until: args.until,
             exclude_superseded_before,
@@ -1050,16 +1061,17 @@ impl Palace {
             anyhow::bail!("reason is empty — say why this filter delete is happening");
         }
 
-        // Validate filter is not empty: at least one of wing/category/room/hall/since/until must be set
+        // Validate filter is not empty: at least one constraint must be set
         if args.wing.is_none()
             && args.category.is_none()
             && args.room.is_none()
             && args.hall.is_none()
+            && args.author.is_none()
             && args.since.is_none()
             && args.until.is_none()
         {
             anyhow::bail!(
-                "filter is empty — at least one of wing/category/room/hall/since/until must be set"
+                "filter is empty — at least one of wing/category/room/hall/author/since/until must be set"
             );
         }
 
@@ -1080,6 +1092,7 @@ impl Palace {
             category: args.category.map(|c| c.trim().to_string()),
             room: args.room.map(|r| r.trim().to_string()),
             hall: args.hall.map(|h| h.trim().to_string()),
+            author: args.author.map(|a| a.trim().to_lowercase()),
             since: args.since,
             until: args.until,
             exclude_superseded_before: if args.include_superseded {
@@ -1235,11 +1248,13 @@ impl Palace {
         let rooms = self.qdrant.facet("room").await?;
         let halls = self.qdrant.facet("hall").await?;
         let categories = self.qdrant.facet("category").await?;
+        let authors = self.qdrant.facet("author").await?;
         Ok(json!({
             "wings": facet_map(&wings),
             "rooms": facet_map(&rooms),
             "halls": facet_map(&halls),
             "categories": facet_map(&categories),
+            "authors": facet_map(&authors),
         }))
     }
 
@@ -1573,6 +1588,7 @@ mod tests {
             category: None,
             room: Some("palazzo".into()),
             hall: None,
+            author: None,
             since: None,
             until: None,
             include_superseded: false,
@@ -1603,6 +1619,7 @@ mod tests {
             category: None,
             room: None,
             hall: None,
+            author: None,
             since: None,
             until: None,
             recency_half_life_days: None,

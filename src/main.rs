@@ -491,6 +491,8 @@ struct ExportParams {
     #[serde(default)]
     hall: Option<String>,
     #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
     since: Option<String>,
     #[serde(default)]
     until: Option<String>,
@@ -536,6 +538,7 @@ async fn export_handler(
         category: params.category.map(|c| c.trim().to_string()),
         room: params.room.map(|r| r.trim().to_string()),
         hall: params.hall.map(|h| h.trim().to_string()),
+        author: params.author.map(|a| a.trim().to_lowercase()),
         since: params.since,
         until: params.until,
         exclude_superseded_before,

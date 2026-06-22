@@ -17,6 +17,8 @@ pub struct FindFilter {
     pub category: Option<String>,
     pub room: Option<String>,
     pub hall: Option<String>,
+    /// Exact-match author (the email stamped at write time). Stored lowercased.
+    pub author: Option<String>,
     /// Inclusive lower bound on `timestamp` (RFC3339).
     pub since: Option<String>,
     /// Inclusive upper bound on `timestamp` (RFC3339).
@@ -33,6 +35,7 @@ impl FindFilter {
             && self.category.is_none()
             && self.room.is_none()
             && self.hall.is_none()
+            && self.author.is_none()
             && self.since.is_none()
             && self.until.is_none()
             && self.exclude_superseded_before.is_none()
@@ -49,6 +52,7 @@ impl FindFilter {
             ("category", &self.category),
             ("room", &self.room),
             ("hall", &self.hall),
+            ("author", &self.author),
         ];
         for (key, val) in pairs {
             if let Some(v) = val {
@@ -407,11 +411,12 @@ impl Qdrant {
     /// Qdrant accepts re-creation as no-op.
     pub async fn ensure_indexes(&self) -> Result<()> {
         let url = self.url("/index?wait=true");
-        let fields: [(&str, &str); 6] = [
+        let fields: [(&str, &str); 7] = [
             ("wing", "keyword"),
             ("category", "keyword"),
             ("room", "keyword"),
             ("hall", "keyword"),
+            ("author", "keyword"),
             ("timestamp", "datetime"),
             ("valid_until", "datetime"),
         ];
@@ -514,6 +519,21 @@ mod tests {
         assert!(must.contains(&json!({"key": "wing", "match": {"value": "projects"}})));
         assert!(must.contains(&json!({"key": "hall", "match": {"value": "facts"}})));
         assert!(q.get("must_not").is_none());
+    }
+
+    #[test]
+    fn author_filter_becomes_must_match() {
+        let f = FindFilter {
+            author: Some("nico@calii.net".into()),
+            ..FindFilter::default()
+        };
+        let q = f.to_qdrant_filter().unwrap();
+        let must = q["must"].as_array().unwrap();
+        assert_eq!(must.len(), 1);
+        assert_eq!(
+            must[0],
+            json!({"key": "author", "match": {"value": "nico@calii.net"}})
+        );
     }
 
     #[test]

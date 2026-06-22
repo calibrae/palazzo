@@ -223,7 +223,7 @@ curl 'http://palazzo-host:6334/export?vectors=false&wing=projects' | head -5
 
 Query params (all optional):
 - `vectors=true|false` (default **true** — include the 768-dim embedding vector)
-- `wing`, `category`, `room`, `hall`, `since`, `until` — same semantics as `palace_find`. Values are trimmed.
+- `wing`, `category`, `room`, `hall`, `author`, `since`, `until` — same semantics as `palace_find`. Values are trimmed (`author` is lowercased to match stored emails).
 - `include_superseded=true|false` (default **false** — by default, only current-truth memories)
 
 Each line is a JSON object with all point fields plus optional `vector`. Errors emit `{"error":"..."}` and close the stream. Bad RFC3339 timestamps return `400` before streaming starts. Same `PALAZZO_ALLOWED_HOSTS` allowlist as `/mcp`.
