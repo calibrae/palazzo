@@ -21,6 +21,11 @@ pub struct Payload {
     pub session: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
+    /// Claimed identity (email) of whoever wrote this memory, when the server
+    /// runs with attribution enabled (`PALAZZO_AUTH=email`). Unverified — it's
+    /// provenance, not proof. Absent for unauthenticated / stdio writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     /// RFC3339 — when this memory started being authoritative. Defaults to
     /// `timestamp` at store time; only differs when callers want explicit
     /// temporal semantics.
@@ -59,6 +64,8 @@ pub struct Memory {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_until: Option<String>,
@@ -84,6 +91,8 @@ pub struct ExportPoint {
     pub session: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

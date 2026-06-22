@@ -1,3 +1,4 @@
+mod auth;
 mod baselines;
 mod embed;
 mod embeddings;
@@ -145,6 +146,10 @@ Environment:
   COLLECTION    (default claude-memory)
   PALAZZO_WAL   (default ~/.palazzo/wal.jsonl)
   PALAZZO_BIND  (default 127.0.0.1:6334 in serve mode)
+  PALAZZO_AUTH  (default off; set 'email' to require a bearer token on /mcp + /ingest and stamp the author)
+  PALAZZO_AUTH_SIGNING_KEY (required when PALAZZO_AUTH=email; >=16 bytes, e.g. `openssl rand -base64 48`)
+  PALAZZO_ALLOWED_EMAIL_DOMAINS (comma-separated allowlist for /whoami; empty = any domain)
+  PALAZZO_TOKEN_TTL_SECS (default 2592000 = 30 days; access-token lifetime)
   PALAZZO_ALLOWED_HOSTS (default localhost,127.0.0.1,::1 — set to \"*\" to disable DNS rebinding check)
   PALAZZO_MAX_INGEST_BYTES (default 67108864 = 64 MiB — body cap for POST /ingest; 32KB/item still enforced)
   FASTEMBED_BATCH_CHUNK (default 16 — fastembed sub-batch size; smaller = lower RSS, larger = faster)
@@ -297,7 +302,8 @@ async fn run_ingest(rest: &[String]) -> Result<()> {
             items: chunk,
             skip_duplicates: None,
         };
-        let result = palace.do_store_batch(args).await?;
+        // CLI ingest is unauthenticated — no attributed author.
+        let result = palace.do_store_batch(args, None).await?;
         totals.stored += result.counts.stored;
         totals.duplicates_returned += result.counts.duplicates_returned;
         totals.skipped_duplicates += result.counts.skipped_duplicates;
@@ -347,9 +353,14 @@ async fn run_ingest(rest: &[String]) -> Result<()> {
 /// only puts the curl command in the conversation, not the file content.
 async fn ingest_handler(
     axum::extract::State(palace): axum::extract::State<std::sync::Arc<Palace>>,
+    identity: Option<axum::Extension<crate::auth::AuthIdentity>>,
     body: String,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+
+    // Present only when auth is enabled and the request carried a valid bearer
+    // (the require_auth middleware injects it). None for unauthenticated ingest.
+    let author = identity.map(|axum::Extension(a)| a.0);
 
     let mut items: Vec<StoreBatchItem> = Vec::new();
     for (lineno, line) in body.lines().enumerate() {
@@ -391,7 +402,7 @@ async fn ingest_handler(
                 items: chunk,
                 skip_duplicates: None,
             };
-            match palace.do_store_batch(args).await {
+            match palace.do_store_batch(args, author.clone()).await {
                 Ok(result) => {
                     totals.stored += result.counts.stored;
                     totals.duplicates_returned += result.counts.duplicates_returned;
@@ -622,14 +633,21 @@ async fn run_http(rest: &[String]) -> Result<()> {
     }
 
     let cfg = Config::from_env();
+    let auth = crate::auth::AuthConfig::from_env()?;
     tracing::info!(
         backend = BACKEND,
         qdrant = %cfg.qdrant_url,
         collection = %cfg.collection,
         bind = %bind,
         mode = "streamable-http",
+        auth = if auth.enabled() { "email" } else { "off" },
         "palazzo starting"
     );
+    if auth.enabled() {
+        tracing::info!(
+            "attribution ON: /mcp and /ingest require a bearer token; mint one at GET /whoami"
+        );
+    }
 
     if let Err(e) = cfg.make_qdrant().ensure_indexes().await {
         tracing::warn!("ensure_indexes: {e:#}");
@@ -732,7 +750,7 @@ async fn run_http(rest: &[String]) -> Result<()> {
     }
     let health_state = Arc::new(HealthState { qdrant_up });
 
-    let ingest_route = axum::Router::new()
+    let mut ingest_route = axum::Router::new()
         .route("/ingest", axum::routing::post(ingest_handler))
         .layer(axum::extract::DefaultBodyLimit::max(max_ingest))
         .with_state(ingest_palace);
@@ -755,19 +773,54 @@ async fn run_http(rest: &[String]) -> Result<()> {
             "/v1/embeddings",
             axum::routing::post(crate::embeddings::embeddings_handler),
         )
+        .route(
+            "/v1/models",
+            axum::routing::get(crate::embeddings::models_handler),
+        )
         .with_state(embed_for_v1);
+
+    // MCP and ingest are the write surfaces — gate them with the bearer
+    // middleware when attribution is enabled. /whoami (token mint), /health,
+    // /metrics, /export, and /v1/* stay open. When auth is off, no middleware
+    // is added and /whoami isn't mounted (behaviour unchanged).
+    let mut mcp_route = axum::Router::new().nest_service("/mcp", service);
+    let whoami_route = if auth.enabled() {
+        mcp_route = mcp_route.layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_auth,
+        ));
+        ingest_route = ingest_route.layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_auth,
+        ));
+        axum::Router::new()
+            .route(
+                "/whoami",
+                axum::routing::get(crate::auth::whoami_get).post(crate::auth::whoami_post),
+            )
+            .with_state(auth.clone())
+    } else {
+        axum::Router::new()
+    };
+
     let router = axum::Router::new()
-        .nest_service("/mcp", service)
+        .merge(mcp_route)
         .merge(ingest_route)
         .merge(health_route)
         .merge(export_route)
         .merge(metrics_route)
-        .merge(embeddings_route);
+        .merge(embeddings_route)
+        .merge(whoami_route);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!(
-        "listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /export (NDJSON stream), POST /v1/embeddings (OpenAI-compatible)"
+        "listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /export (NDJSON stream), POST /v1/embeddings + GET /v1/models (OpenAI-compatible){}",
+        if auth.enabled() {
+            ", GET/POST /whoami (token mint)"
+        } else {
+            ""
+        }
     );
 
     let shutdown = ct.clone();

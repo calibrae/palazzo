@@ -176,6 +176,19 @@ pub async fn embeddings_handler(
     }
 }
 
+/// `GET /v1/models` — OpenAI-compatible model list. palazzo serves one model;
+/// discovery/validation tooling expects a non-empty `data` array here.
+pub async fn models_handler() -> axum::Json<serde_json::Value> {
+    axum::Json(json!({
+        "object": "list",
+        "data": [{
+            "id": "nomic-embed-text",
+            "object": "model",
+            "owned_by": "palazzo",
+        }],
+    }))
+}
+
 fn error_response(status: StatusCode, msg: &str) -> Response {
     (
         status,

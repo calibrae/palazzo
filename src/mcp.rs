@@ -310,9 +310,10 @@ impl Palace {
     async fn palace_store(
         &self,
         Parameters(args): Parameters<StoreArgs>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         let started = Instant::now();
-        let res = self.do_store(args).await;
+        let res = self.do_store(args, author_from(&extensions)).await;
         self.finish_tool("palace_store", started, res)
     }
 
@@ -322,9 +323,10 @@ impl Palace {
     async fn palace_store_batch(
         &self,
         Parameters(args): Parameters<StoreBatchArgs>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         let started = Instant::now();
-        let res = self.do_store_batch(args).await;
+        let res = self.do_store_batch(args, author_from(&extensions)).await;
         self.finish_tool("palace_store_batch", started, res)
     }
 
@@ -376,9 +378,10 @@ impl Palace {
     async fn palace_supersede(
         &self,
         Parameters(args): Parameters<SupersedeArgs>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         let started = Instant::now();
-        let res = self.do_supersede(args).await;
+        let res = self.do_supersede(args, author_from(&extensions)).await;
         self.finish_tool("palace_supersede", started, res)
     }
 
@@ -443,7 +446,11 @@ fn dedup_filter() -> FindFilter {
 }
 
 impl Palace {
-    async fn do_store(&self, args: StoreArgs) -> anyhow::Result<StoreResult> {
+    async fn do_store(
+        &self,
+        args: StoreArgs,
+        author: Option<String>,
+    ) -> anyhow::Result<StoreResult> {
         if args.text.len() > MAX_TEXT_BYTES {
             anyhow::bail!(
                 "text too large: {} bytes (max {})",
@@ -490,6 +497,7 @@ impl Palace {
             timestamp: timestamp.clone(),
             session: args.session.clone(),
             source_file: args.source_file.clone(),
+            author,
             valid_from: None,
             valid_until: None,
             supersedes: None,
@@ -507,6 +515,7 @@ impl Palace {
                 "category": payload.category,
                 "text_preview": preview(&payload.text),
                 "session": payload.session,
+                "author": payload.author,
             }),
         );
 
@@ -527,6 +536,7 @@ impl Palace {
     pub(crate) async fn do_store_batch(
         &self,
         args: StoreBatchArgs,
+        author: Option<String>,
     ) -> anyhow::Result<BatchStoreResult> {
         if args.items.is_empty() {
             anyhow::bail!("items is empty — nothing to store");
@@ -635,6 +645,7 @@ impl Palace {
                 timestamp: now.clone(),
                 session: item.session.clone(),
                 source_file: item.source_file.clone(),
+                author: author.clone(),
                 valid_from: None,
                 valid_until: None,
                 supersedes: None,
@@ -651,6 +662,7 @@ impl Palace {
                     "category": payload.category,
                     "text_preview": preview(&payload.text),
                     "session": payload.session,
+                    "author": payload.author,
                 }),
             );
             new_ids[idx] = Some(id);
@@ -828,7 +840,11 @@ impl Palace {
         Ok(hits)
     }
 
-    async fn do_supersede(&self, args: SupersedeArgs) -> anyhow::Result<SupersedeResult> {
+    async fn do_supersede(
+        &self,
+        args: SupersedeArgs,
+        author: Option<String>,
+    ) -> anyhow::Result<SupersedeResult> {
         if args.text.len() > MAX_TEXT_BYTES {
             anyhow::bail!(
                 "text too large: {} bytes (max {})",
@@ -869,6 +885,7 @@ impl Palace {
             timestamp: now.clone(),
             session: args.session.clone(),
             source_file: args.source_file.clone(),
+            author,
             valid_from: Some(now.clone()),
             valid_until: None,
             supersedes: Some(args.supersedes.clone()),
@@ -888,6 +905,7 @@ impl Palace {
                 "category": payload.category,
                 "text_preview": preview(&payload.text),
                 "session": payload.session,
+                "author": payload.author,
             }),
         );
 
@@ -1375,6 +1393,16 @@ impl ServerHandler for Palace {
 /// can never mint the same ID — a collision would silently overwrite the
 /// earlier point on upsert.
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pull the attributed author (if any) out of the request context. rmcp injects
+/// the HTTP `Parts` into the request extensions; the auth middleware put an
+/// `AuthIdentity` inside `Parts.extensions`. Absent (None) for stdio transport
+/// and for unauthenticated requests — so this is always optional.
+fn author_from(ext: &rmcp::model::Extensions) -> Option<String> {
+    ext.get::<axum::http::request::Parts>()
+        .and_then(|p| p.extensions.get::<crate::auth::AuthIdentity>())
+        .map(|a| a.0.clone())
+}
 
 fn new_id() -> u64 {
     use std::sync::atomic::Ordering;
@@ -1957,11 +1985,11 @@ mod tests {
     #[tokio::test]
     async fn store_rejects_empty_and_oversized_text() {
         let p = test_palace("http://127.0.0.1:9", None);
-        let err = p.do_store(store_args("   ")).await.unwrap_err();
+        let err = p.do_store(store_args("   "), None).await.unwrap_err();
         assert!(err.to_string().contains("empty"), "{err:#}");
 
         let err = p
-            .do_store(store_args(&"x".repeat(MAX_TEXT_BYTES + 1)))
+            .do_store(store_args(&"x".repeat(MAX_TEXT_BYTES + 1)), None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("too large"), "{err:#}");
@@ -2009,7 +2037,7 @@ mod tests {
             );
             let p = test_palace(&mock.url, None);
 
-            let res = p.do_store(store_args("same text")).await.unwrap();
+            let res = p.do_store(store_args("same text"), None).await.unwrap();
             assert_eq!(res.id, 42);
             assert_eq!(res.duplicate_of, Some(42));
             // No write happened.
@@ -2032,7 +2060,7 @@ mod tests {
             );
             let p = test_palace(&mock.url, None);
 
-            let res = p.do_store(store_args("same text")).await.unwrap();
+            let res = p.do_store(store_args("same text"), None).await.unwrap();
             assert!(res.id >= 1_000_000_000);
             assert_eq!(res.duplicate_of, None);
             let upserts = mock.requests_for("PUT /points");
@@ -2054,14 +2082,17 @@ mod tests {
             let p = test_palace(&mock.url, None);
 
             let res = p
-                .do_store_batch(StoreBatchArgs {
-                    items: vec![
-                        batch_item("   "), // invalid
-                        batch_item("dup text"),
-                        batch_item("fresh text"),
-                    ],
-                    skip_duplicates: None,
-                })
+                .do_store_batch(
+                    StoreBatchArgs {
+                        items: vec![
+                            batch_item("   "), // invalid
+                            batch_item("dup text"),
+                            batch_item("fresh text"),
+                        ],
+                        skip_duplicates: None,
+                    },
+                    None,
+                )
                 .await
                 .unwrap();
 

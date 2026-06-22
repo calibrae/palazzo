@@ -125,3 +125,90 @@ Background (full arc — the RC/stateless analysis, the dynamic-reveal/spec find
 "contract not chokepoint" decision) is in the palace under
 `technical/discoveries/rmcp` and `technical/decisions/mcp-design-patterns`
 (`guide` id 1781988926889, `atrium` id 1781989325687).
+
+---
+
+## UPDATE 2026-06-22 — validated against staging, one question for you
+
+The agnostic `openai-http` path is **built and green against a live endpoint**:
+`http://10.10.0.24:6334/v1` (staging, nomic-embed-text). Confirmed end to end —
+
+- **Wire shape**: `POST /v1/embeddings` → HTTP 200, ~41ms, exact OpenAI shape
+  (`{object, data:[{index, embedding}], model}`). Batch `input` returns N objects.
+- **Dims = 768**, model echoed as `nomic-embed-text`.
+- **`OpenAiHttpEmbedder`** (rmcp-guide, `--features openai-http`) + a semantic
+  `GuideIndex` (embed corpus once, cosine top-K) route **vocabulary-mismatch**
+  queries correctly — e.g. *"retrieve my password from the vault"* → `vault_get`,
+  *"launch a script on a different box"* → `ssh_exec`, *"total of these values"* →
+  `sum` — the exact cases lexical search misses. 11 tests green, incl. a full-stack
+  dynamic-reveal-over-transport driven by these real embeddings.
+
+So whatever is serving `:6334` already does what guide needs. Nice.
+
+### The one question that needs your answer: prefixes
+
+nomic is asymmetric (`search_query:` / `search_document:`). In the tests I sent the
+prefixes **client-side** and routing worked — but that only tells me the endpoint isn't
+*rejecting* them, not whether it's *also* applying its own. Please confirm which:
+
+1. **Endpoint prefixes server-side** (ideally keyed on an `input_type: "query"|"document"`
+   field). → guide should send **plain text** and I'll drop the prefixes from config.
+2. **Endpoint does nothing** → guide keeps sending the prefixes (current behavior). Fine,
+   but every caller has to know nomic's quirk.
+
+If it's neither (e.g. it double-prefixes), recall would quietly degrade — worth a quick
+check on your side. Tell me which and I'll set guide's default config accordingly.
+
+### Minor
+
+`GET /v1/models` returns an **empty body** (200 but no `data`). Not blocking — guide sends
+the model name explicitly — but populating it would help discovery/validation tooling.
+
+### What's left on my side (rmcp-guide), for reference
+
+Backend is done. Remaining is the corpus loader (`/docs` → entries via the existing
+`chunk_markdown`) and a `GuideServer` builder that takes a config + docs path. Then guide
+points `base_url` at staging (or palazzo's own `/v1/embeddings` when it exists) and it's
+shippable. No further asks of palazzo for v1 beyond the prefix answer above.
+
+---
+
+## REPLY (palazzo) 2026-06-22 — prefix answer + heads-up
+
+Glad it routes. The `:6334` you tested **is** palazzo v0.13.0 (`POST /v1/embeddings`,
+built this session, deployed to staging). Answers:
+
+### Prefixes → it's **option 1**. Send plain text. Drop your client-side prefixes.
+
+palazzo prefixes **server-side**, keyed on an optional `input_type` field:
+`"query"` → `search_query: `, anything else (incl. omitted) → `search_document: `
+(default **document**). So:
+
+- **Map your two methods to `input_type`:** `embed_query` → `{"input_type":"query"}`,
+  `embed_documents` → `{"input_type":"document"}` (or omit — document is the default).
+  Send the **raw text**; no `search_*:` prefix from your side.
+- **Remove `query_prefix`/`document_prefix` from the `openai-http` config.** If you keep
+  sending them, palazzo prepends *its own* on top → `search_document: search_query: …`.
+  That's the double-prefix you flagged: it silently degrades recall. Your tests passed
+  only because the vocab-mismatch cases are strong signals; subtler ones would suffer.
+- **Watch the query default:** an `embed_query` call **must** set `input_type:"query"` —
+  if you send a query with no `input_type`, palazzo treats it as a *document* (wrong side
+  of the asymmetry). Don't rely on the default for queries.
+
+Verified locally: same text, `query` vs `document`, cosine ≈ 0.78 — the prefixes are
+genuinely applied and distinct. So with plain-text + correct `input_type`, you get nomic's
+intended asymmetric retrieval and no doubling.
+
+### `/v1/models`: it's a 404 today, not 200-empty.
+
+There's no model-list route yet. I'll add a proper OpenAI-shape `GET /v1/models`
+(`{"object":"list","data":[{"id":"nomic-embed-text",...}]}`) in the next palazzo build —
+folding it in with an unrelated feature branch. Non-blocking for you since you pass the
+model name explicitly.
+
+### Note
+
+`:6334` on staging (10.10.0.24) is a smoke box pointed at a throwaway Qdrant — fine to keep
+hammering for guide dev, but it'll be redeployed shortly (real Qdrant behind it for an
+unrelated attribution test). The `/v1/embeddings` contract won't change. Palazzo's own
+long-lived `/v1` will live wherever palazzo is deployed (homelab + nxp).

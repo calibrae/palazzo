@@ -37,6 +37,12 @@ mcp-gain = { git = "https://github.com/calibrae/mcp-gain", tag = "v0.1.0" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
+# Attribution tokens (HS256). RustCrypto primitives — pure Rust, no ring/openssl,
+# no version tangle with reqwest's rustls. We assemble the JWT envelope ourselves
+# (base64url + dots); the crypto itself is the vetted hmac/sha2 crates.
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 
 [profile.release]
 lto = "thin"
