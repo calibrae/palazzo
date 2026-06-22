@@ -190,7 +190,11 @@ pub async fn whoami_get() -> Html<&'static str> {
 
 /// `POST /whoami` — validate the email against the domain allowlist, mint a
 /// token, show it for the dev to paste into their MCP client config.
-pub async fn whoami_post(State(cfg): State<AuthConfig>, Form(form): Form<WhoamiForm>) -> Response {
+pub async fn whoami_post(
+    State(cfg): State<AuthConfig>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<WhoamiForm>,
+) -> Response {
     let email = form.email.trim().to_lowercase();
     if !cfg.email_allowed(&email) {
         return (
@@ -205,7 +209,22 @@ pub async fn whoami_post(State(cfg): State<AuthConfig>, Form(form): Form<WhoamiF
             .into_response();
     }
     let token = cfg.mint(&email);
-    Html(token_page(&email, &token)).into_response()
+    Html(token_page(&email, &token, &base_url(&headers))).into_response()
+}
+
+/// Best-effort public base URL for the example commands, from the request: the
+/// `Host` header for authority, `X-Forwarded-Proto` for scheme (nginx sets it
+/// in front of palazzo; absent → plain http, as on the LAN staging box).
+fn base_url(headers: &axum::http::HeaderMap) -> String {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("PALAZZO");
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("http");
+    format!("{scheme}://{host}")
 }
 
 fn html_escape(s: &str) -> String {
@@ -227,25 +246,61 @@ style=\"padding:.5rem;width:20rem;font-size:1rem\">\
 <button type=submit style=\"padding:.5rem 1rem;font-size:1rem\">Get token</button>\
 </form></body>";
 
-fn token_page(email: &str, token: &str) -> String {
-    format!(
-        "<!doctype html><meta charset=utf-8><title>palazzo — token</title>\
-<body style=\"font-family:system-ui;max-width:48rem;margin:3rem auto;line-height:1.5\">\
-<h2>Token for {email}</h2>\
-<p>Paste this into your MCP client's headers as <code>Authorization: Bearer &lt;token&gt;</code>. \
-It's valid for a while; revisit this page when it expires.</p>\
-<textarea readonly rows=4 style=\"width:100%;font-family:monospace;font-size:.85rem\" \
-onclick=\"this.select()\">{token}</textarea>\
-<h3>Examples</h3>\
-<pre style=\"background:#f4f4f8;padding:1rem;overflow:auto\">\
-# Claude Code\nclaude mcp add --transport http palazzo https://PALAZZO/mcp --header \"Authorization: Bearer {token_short}…\"\n\n\
-# OpenCode (opencode.json)\n{{ \"mcp\": {{ \"palazzo\": {{ \"type\":\"remote\", \"url\":\"https://PALAZZO/mcp\", \"headers\": {{ \"Authorization\":\"Bearer {token_short}…\" }} }} }} }}\
-</pre></body>",
-        email = html_escape(email),
-        token = html_escape(token),
-        token_short = html_escape(token.split('.').next().unwrap_or("")),
-    )
+fn token_page(email: &str, token: &str, base: &str) -> String {
+    // Full token embedded in every copy target — the buttons copy exactly what
+    // you'd paste, token and all. Built here, escaped for display; the copy JS
+    // reads textContent/value (entities decoded) so the clipboard gets raw text.
+    let claude = format!(
+        "claude mcp add --transport http palazzo {base}/mcp --header \"Authorization: Bearer {token}\""
+    );
+    let opencode = format!(
+        r#"{{ "mcp": {{ "palazzo": {{ "type":"remote", "url":"{base}/mcp", "headers": {{ "Authorization":"Bearer {token}" }} }} }} }}"#
+    );
+    TOKEN_PAGE_TMPL
+        .replace("__EMAIL__", &html_escape(email))
+        .replace("__TOKEN__", &html_escape(token))
+        .replace("__CLAUDE__", &html_escape(&claude))
+        .replace("__OPENCODE__", &html_escape(&opencode))
 }
+
+const TOKEN_PAGE_TMPL: &str = r##"<!doctype html><meta charset=utf-8><title>palazzo — token</title>
+<style>
+body{font-family:system-ui;max-width:52rem;margin:3rem auto;line-height:1.5;padding:0 1rem}
+.row{position:relative;margin:.6rem 0}
+pre,textarea{background:#f4f4f8;border:1px solid #ddd;border-radius:6px;padding:1rem;
+  width:100%;font-family:ui-monospace,monospace;font-size:.85rem;box-sizing:border-box;overflow:auto;white-space:pre-wrap;word-break:break-all}
+button.copy{position:absolute;top:.5rem;right:.5rem;padding:.3rem .7rem;font-size:.8rem;
+  border:1px solid #bbb;border-radius:6px;background:#fff;cursor:pointer}
+button.copy:hover{background:#eee}
+h3{margin-top:1.6rem}
+</style>
+<body>
+<h2>Token for __EMAIL__</h2>
+<p>Paste as <code>Authorization: Bearer &lt;token&gt;</code> in your MCP client. Valid ~30 days; revisit when it expires.</p>
+<div class=row><button class=copy data-target=tok>Copy token</button>
+<textarea id=tok readonly rows=3>__TOKEN__</textarea></div>
+<h3>Claude Code</h3>
+<div class=row><button class=copy data-target=cc>Copy</button><pre id=cc>__CLAUDE__</pre></div>
+<h3>OpenCode <span style="font-weight:normal;color:#666">(opencode.json)</span></h3>
+<div class=row><button class=copy data-target=oc>Copy</button><pre id=oc>__OPENCODE__</pre></div>
+<script>
+document.querySelectorAll('button.copy').forEach(function(b){
+  b.addEventListener('click',function(){
+    var el=document.getElementById(b.dataset.target);
+    var text=el.tagName==='TEXTAREA'?el.value:el.textContent;
+    function done(){var o=b.textContent;b.textContent='Copied!';setTimeout(function(){b.textContent=o;},1200);}
+    function fallback(){
+      var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';
+      document.body.appendChild(ta);ta.focus();ta.select();
+      try{document.execCommand('copy');}catch(e){}
+      document.body.removeChild(ta);done();
+    }
+    if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(text).then(done,fallback);}
+    else{fallback();}
+  });
+});
+</script>
+</body>"##;
 
 #[cfg(test)]
 mod tests {
