@@ -228,6 +228,19 @@ Query params (all optional):
 
 Each line is a JSON object with all point fields plus optional `vector`. Errors emit `{"error":"..."}` and close the stream. Bad RFC3339 timestamps return `400` before streaming starts. Same `PALAZZO_ALLOWED_HOSTS` allowlist as `/mcp`.
 
+### OpenAI-compatible embeddings (`POST /v1/embeddings`)
+
+A thin shim over the shared fastembed model, so any client speaking the OpenAI embeddings wire shape can borrow palazzo's embedder as "just a URL" — no palazzo-specific code on the caller side.
+
+```
+curl http://palazzo-host:6334/v1/embeddings -X POST -H 'content-type: application/json' \
+  -d '{"model":"nomic-embed-text","input":["text one","text two"],"input_type":"document"}'
+```
+
+Response is the standard `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[...]}],"model":...}`. `input` accepts a bare string or an array of strings; `model` is echoed back (palazzo runs a single model, so the value is informational).
+
+**Prefix asymmetry.** nomic-embed-text-v1.5 wants `search_query:` / `search_document:` instruction prefixes, which this endpoint applies server-side keyed off the optional `input_type` field (`"query"` | `"document"`, default `document`). Note this is a **different vector space** from the palace's own memories: `palace_*` embeds prefix-free to stay compatible with the existing `claude-memory` collection, while `/v1/embeddings` is prefixed for retrieval quality — never mix the two in one collection. Caps: 512 inputs/request, 32 KB/item. Same `PALAZZO_ALLOWED_HOSTS` allowlist as `/mcp`.
+
 ### Bulk ingest from a file (`palazzo ingest`)
 
 ```

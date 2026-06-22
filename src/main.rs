@@ -1,5 +1,6 @@
 mod baselines;
 mod embed;
+mod embeddings;
 mod mcp;
 mod qdrant;
 mod schema;
@@ -121,8 +122,10 @@ fn print_help() {
         "palazzo {} — MCP server over Qdrant memory palace
 Usage:
   palazzo                      Serve MCP over stdio (default)
-  palazzo serve [--bind ADDR]  Serve MCP over Streamable HTTP at POST /mcp,
-                               and a sibling NDJSON bulk-ingest endpoint at POST /ingest.
+  palazzo serve [--bind ADDR]  Serve MCP over Streamable HTTP at POST /mcp, plus sibling
+                               HTTP endpoints: POST /ingest (NDJSON bulk), GET /export
+                               (NDJSON stream), and POST /v1/embeddings (OpenAI-compatible
+                               embeddings over the shared fastembed model).
                                (default ADDR: 127.0.0.1:6334, override with PALAZZO_BIND)
   palazzo gain [--since-secs N] [--json]
                                Render the token-savings report from PALAZZO_USAGE_LOG.
@@ -672,6 +675,10 @@ async fn run_http(rest: &[String]) -> Result<()> {
     let shared_embedder = make_embedder(&cfg)?;
     let ingest_palace =
         std::sync::Arc::new(cfg.make_palace_with_embedder(shared_embedder.clone())?);
+    // Clone for the /v1/embeddings route before the original is moved into the
+    // MCP factory closure. Embedder::Clone shares the inner model Arc — still one
+    // TextEmbedding in memory.
+    let embed_for_v1 = shared_embedder.clone();
     let cfg = std::sync::Arc::new(cfg);
     let mcp_cfg = cfg.clone();
     let mcp_embedder = shared_embedder;
@@ -743,17 +750,24 @@ async fn run_http(rest: &[String]) -> Result<()> {
             async move { body }
         }),
     );
+    let embeddings_route = axum::Router::new()
+        .route(
+            "/v1/embeddings",
+            axum::routing::post(crate::embeddings::embeddings_handler),
+        )
+        .with_state(embed_for_v1);
     let router = axum::Router::new()
         .nest_service("/mcp", service)
         .merge(ingest_route)
         .merge(health_route)
         .merge(export_route)
-        .merge(metrics_route);
+        .merge(metrics_route)
+        .merge(embeddings_route);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!(
-        "listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /export (NDJSON stream)"
+        "listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /export (NDJSON stream), POST /v1/embeddings (OpenAI-compatible)"
     );
 
     let shutdown = ct.clone();
