@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "staging_palazzo": {
+      "type": "http",
+      "url": "http://10.10.0.24:6334/mcp",
+      "headers": {
+        "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3ODQ3Mjg3NDMsImlhdCI6MTc4MjEzNjc0Mywic3ViIjoibmljb0BjYWxpaS5uZXQifQ._YTcoKRmNsbSo7n35VHCtXeZzrhomvIE8BqAHxFDKlo"
+      }
+    }
+  }
+}

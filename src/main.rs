@@ -3,6 +3,7 @@ mod baselines;
 mod embed;
 mod embeddings;
 mod mcp;
+mod oauth;
 mod qdrant;
 mod schema;
 #[cfg(test)]
@@ -146,10 +147,14 @@ Environment:
   COLLECTION    (default claude-memory)
   PALAZZO_WAL   (default ~/.palazzo/wal.jsonl)
   PALAZZO_BIND  (default 127.0.0.1:6334 in serve mode)
-  PALAZZO_AUTH  (default off; set 'email' to require a bearer token on /mcp + /ingest and stamp the author)
+  PALAZZO_AUTH  (default off; 'email' gates /mcp + /ingest, stamps the author, and serves the
+                OAuth Authenticate flow — clients hit /mcp, get a 401, and drive the browser login)
   PALAZZO_AUTH_SIGNING_KEY (required when PALAZZO_AUTH=email; >=16 bytes, e.g. `openssl rand -base64 48`)
-  PALAZZO_ALLOWED_EMAIL_DOMAINS (comma-separated allowlist for /whoami; empty = any domain)
-  PALAZZO_TOKEN_TTL_SECS (default 2592000 = 30 days; access-token lifetime)
+  PALAZZO_ALLOWED_EMAIL_DOMAINS (comma-separated allowlist for /whoami and OAuth /authorize; empty = any)
+  PALAZZO_AUTH_ISSUER (canonical public base URL in OAuth metadata; default: derived from Host/X-Forwarded-Proto)
+  PALAZZO_TOKEN_TTL_SECS (default 2592000 = 30 days; static /whoami paste-token lifetime)
+  PALAZZO_ACCESS_TTL_SECS (default 3600 = 1 h; OAuth access-token lifetime, refreshed silently)
+  PALAZZO_REFRESH_TTL_SECS (default 7776000 = 90 days; OAuth refresh-token lifetime)
   PALAZZO_ALLOWED_HOSTS (default localhost,127.0.0.1,::1 — set to \"*\" to disable DNS rebinding check)
   PALAZZO_MAX_INGEST_BYTES (default 67108864 = 64 MiB — body cap for POST /ingest; 32KB/item still enforced)
   FASTEMBED_BATCH_CHUNK (default 16 — fastembed sub-batch size; smaller = lower RSS, larger = faster)
@@ -803,6 +808,31 @@ async fn run_http(rest: &[String]) -> Result<()> {
         axum::Router::new()
     };
 
+    // OAuth 2.1 Authorization Server endpoints (the "Authenticate" button flow).
+    // Public — the MCP client hits these before it has a token. Mounted only
+    // when auth is enabled.
+    let oauth_routes = if auth.enabled() {
+        let st = crate::oauth::OAuthState::new(auth.clone());
+        axum::Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource",
+                axum::routing::get(crate::oauth::protected_resource),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server",
+                axum::routing::get(crate::oauth::authorization_server),
+            )
+            .route("/register", axum::routing::post(crate::oauth::register))
+            .route(
+                "/authorize",
+                axum::routing::get(crate::oauth::authorize_get).post(crate::oauth::authorize_post),
+            )
+            .route("/token", axum::routing::post(crate::oauth::token))
+            .with_state(st)
+    } else {
+        axum::Router::new()
+    };
+
     let router = axum::Router::new()
         .merge(mcp_route)
         .merge(ingest_route)
@@ -810,7 +840,8 @@ async fn run_http(rest: &[String]) -> Result<()> {
         .merge(export_route)
         .merge(metrics_route)
         .merge(embeddings_route)
-        .merge(whoami_route);
+        .merge(whoami_route)
+        .merge(oauth_routes);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("bind {bind}"))?;

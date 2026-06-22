@@ -1,6 +1,6 @@
 [package]
 name = "palazzo"
-version = "0.13.1"
+version = "0.14.0"
 edition = "2024"
 description = "Self-contained Rust MCP memory palace — Qdrant + local fastembed, typed wing/room/hall schema, temporal supersede, token-savings analytics."
 repository = "https://github.com/calibrae/palazzo"
@@ -43,6 +43,8 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+# CSPRNG for OAuth authorization codes. Tiny, pure, already deep in the tree.
+getrandom = "0.2"
 
 [profile.release]
 lto = "thin"

@@ -2168,7 +2168,7 @@ dependencies = [
 
 [[package]]
 name = "palazzo"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2176,6 +2176,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "fastembed",
+ "getrandom 0.2.17",
  "hmac",
  "mcp-gain",
  "metrics",

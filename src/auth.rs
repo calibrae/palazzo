@@ -42,7 +42,15 @@ pub struct AuthConfig {
     pub mode: AuthMode,
     signing_key: Arc<Vec<u8>>,
     allowed_domains: Arc<Vec<String>>,
+    /// Lifetime of the static `/whoami` paste token (the manual path).
     ttl_secs: u64,
+    /// Lifetime of OAuth access tokens (short — refreshed silently).
+    access_ttl_secs: u64,
+    /// Lifetime of OAuth refresh tokens (long — the low-maintenance bit).
+    refresh_ttl_secs: u64,
+    /// Canonical public base URL advertised in OAuth metadata (`issuer`). When
+    /// unset, derived per-request from Host/X-Forwarded-Proto.
+    issuer: Option<Arc<String>>,
 }
 
 fn now() -> u64 {
@@ -73,15 +81,24 @@ impl AuthConfig {
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .collect();
-        let ttl_secs = std::env::var("PALAZZO_TOKEN_TTL_SECS")
+        let env_secs = |k: &str, default: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        };
+        let issuer = std::env::var("PALAZZO_AUTH_ISSUER")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30 * 24 * 3600);
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| Arc::new(s.trim().trim_end_matches('/').to_string()));
         Ok(Self {
             mode,
             signing_key: Arc::new(signing_key.into_bytes()),
             allowed_domains: Arc::new(allowed_domains),
-            ttl_secs,
+            ttl_secs: env_secs("PALAZZO_TOKEN_TTL_SECS", 30 * 24 * 3600),
+            access_ttl_secs: env_secs("PALAZZO_ACCESS_TTL_SECS", 3600),
+            refresh_ttl_secs: env_secs("PALAZZO_REFRESH_TTL_SECS", 90 * 24 * 3600),
+            issuer,
         })
     }
 
@@ -92,6 +109,22 @@ impl AuthConfig {
             signing_key: Arc::new(key.as_bytes().to_vec()),
             allowed_domains: Arc::new(domains.iter().map(|d| d.to_lowercase()).collect()),
             ttl_secs: 3600,
+            access_ttl_secs: 3600,
+            refresh_ttl_secs: 7200,
+            issuer: None,
+        }
+    }
+
+    pub(crate) fn access_ttl_secs(&self) -> u64 {
+        self.access_ttl_secs
+    }
+
+    /// Public base URL for OAuth metadata: configured issuer, else derived from
+    /// the request's Host + X-Forwarded-Proto.
+    pub(crate) fn issuer_base(&self, headers: &axum::http::HeaderMap) -> String {
+        match &self.issuer {
+            Some(s) => s.as_str().to_string(),
+            None => base_url(headers),
         }
     }
 
@@ -100,7 +133,7 @@ impl AuthConfig {
     }
 
     /// Basic shape check + domain allowlist. Empty allowlist accepts any domain.
-    fn email_allowed(&self, email: &str) -> bool {
+    pub(crate) fn email_allowed(&self, email: &str) -> bool {
         let parts: Vec<&str> = email.split('@').collect();
         if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
             return false;
@@ -119,21 +152,37 @@ impl AuthConfig {
         B64.encode(mac.finalize().into_bytes())
     }
 
-    /// Mint an HS256 token carrying the email as `sub`, with `iat`/`exp`.
-    pub fn mint(&self, email: &str) -> String {
+    /// Mint an HS256 token: `sub` = email, `typ` = access|refresh, `iat`/`exp`.
+    fn mint_typed(&self, email: &str, typ: &str, ttl_secs: u64) -> String {
         let header = B64.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
         let iat = now();
-        let exp = iat + self.ttl_secs;
-        let claims = serde_json::json!({ "sub": email, "iat": iat, "exp": exp }).to_string();
+        let exp = iat + ttl_secs;
+        let claims =
+            serde_json::json!({ "sub": email, "typ": typ, "iat": iat, "exp": exp }).to_string();
         let payload = B64.encode(claims.as_bytes());
         let signing_input = format!("{header}.{payload}");
         let sig = self.sign(&signing_input);
         format!("{signing_input}.{sig}")
     }
 
-    /// Validate a token: constant-time signature check, then `exp`. Returns the
-    /// `sub` (email) on success, `None` on any failure.
-    pub fn verify(&self, token: &str) -> Option<String> {
+    /// Static `/whoami` paste token (long-lived access token).
+    pub fn mint(&self, email: &str) -> String {
+        self.mint_typed(email, "access", self.ttl_secs)
+    }
+
+    /// OAuth access token (short-lived; the client refreshes it silently).
+    pub(crate) fn mint_access(&self, email: &str) -> String {
+        self.mint_typed(email, "access", self.access_ttl_secs)
+    }
+
+    /// OAuth refresh token (long-lived).
+    pub(crate) fn mint_refresh(&self, email: &str) -> String {
+        self.mint_typed(email, "refresh", self.refresh_ttl_secs)
+    }
+
+    /// Validate sig + `exp` + `typ`. Returns `sub` (email). A missing `typ` is
+    /// treated as `access` (back-compat with pre-typ `/whoami` tokens).
+    fn verify_typed(&self, token: &str, want_typ: &str) -> Option<String> {
         let parts: Vec<&str> = token.split('.').collect();
         if parts.len() != 3 {
             return None;
@@ -148,10 +197,28 @@ impl AuthConfig {
         if now() >= exp {
             return None;
         }
+        let typ = claims
+            .get("typ")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("access");
+        if typ != want_typ {
+            return None;
+        }
         claims
             .get("sub")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned)
+    }
+
+    /// Validate an access token (used by the bearer middleware). Refresh tokens
+    /// are rejected here — they only work at the token endpoint.
+    pub fn verify(&self, token: &str) -> Option<String> {
+        self.verify_typed(token, "access")
+    }
+
+    /// Validate a refresh token (used by the OAuth token endpoint).
+    pub(crate) fn verify_refresh(&self, token: &str) -> Option<String> {
+        self.verify_typed(token, "refresh")
     }
 }
 
@@ -159,22 +226,30 @@ impl AuthConfig {
 /// token, injects [`AuthIdentity`] into the request extensions (which rmcp
 /// surfaces to tool handlers), and 401s otherwise.
 pub async fn require_auth(State(cfg): State<AuthConfig>, mut req: Request, next: Next) -> Response {
-    let token = req
+    let verified: Option<String> = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
-    match token.and_then(|t| cfg.verify(t)) {
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .and_then(|t| cfg.verify(t));
+    match verified {
         Some(email) => {
             req.extensions_mut().insert(AuthIdentity(email));
             next.run(req).await
         }
-        None => (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            "unauthorized: present a valid bearer token — get one from /whoami\n",
-        )
-            .into_response(),
+        None => {
+            // RFC 9728: point clients at the protected-resource metadata so the
+            // MCP client offers "Authenticate" and discovers the OAuth endpoints.
+            let base = cfg.issuer_base(req.headers());
+            let challenge =
+                format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\"");
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, challenge)],
+                "unauthorized: authenticate via the MCP client, or paste a token from /whoami\n",
+            )
+                .into_response()
+        }
     }
 }
 
