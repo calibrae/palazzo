@@ -6,3 +6,4 @@ resume.sh
 .claude/
 .fastembed_cache/
 .env
+.mcp.json
