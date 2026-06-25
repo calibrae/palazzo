@@ -24,6 +24,9 @@ include:
       imageTag: "${CI_COMMIT_SHORT_SHA}"
       pathToDockerfile: ./Dockerfile.cloud
 
+Docker:Build:palazzo:
+  before_script: []
+
 default:
   image: rust:1
   before_script:
