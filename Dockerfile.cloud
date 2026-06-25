@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+
+# Runtime-only image build for CI/cloud use.
+# Expects a prebuilt binary in the build context at: target/release/palazzo
+FROM debian:trixie-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --create-home --home-dir /var/lib/palazzo palazzo
+
+COPY target/release/palazzo /usr/local/bin/palazzo
+
+ENV PALAZZO_BIND=0.0.0.0:6334 \
+    QDRANT_URL=http://qdrant:6333 \
+    COLLECTION=claude-memory \
+    FASTEMBED_CACHE_DIR=/var/lib/palazzo/fastembed-cache \
+    PALAZZO_WAL=/var/lib/palazzo/wal.jsonl \
+    PALAZZO_USAGE_LOG=/var/lib/palazzo/usage.jsonl \
+    RUST_LOG=palazzo=info
+
+USER palazzo
+WORKDIR /var/lib/palazzo
+EXPOSE 6334
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:6334/health || exit 1
+
+ENTRYPOINT ["palazzo"]
+CMD ["serve"]

@@ -22,7 +22,7 @@ include:
       stage: package
       componentName: palazzo
       imageTag: "${CI_COMMIT_SHORT_SHA}"
-      pathToDockerfile: ./Dockerfile
+      pathToDockerfile: ./Dockerfile.cloud
 
 default:
   image: rust:1
@@ -79,3 +79,4 @@ cargo_audit:
   script:
     - cargo install --locked cargo-audit
     - cargo audit --deny warnings --ignore RUSTSEC-2024-0436
+
