@@ -1,0 +1,81 @@
+stages:
+  - lint
+  - build
+  - test
+  - security
+  - package
+
+#workflow:
+#  rules:
+#    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+#    - if: $CI_COMMIT_BRANCH
+#    - if: $CI_COMMIT_TAG
+
+variables:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+
+include:
+  - component: $CI_SERVER_FQDN/di/devops/gitlab-ci-components/docker-build@main
+    inputs:
+      stage: package
+      componentName: palazzo
+      imageTag: "${CI_COMMIT_SHORT_SHA}"
+      pathToDockerfile: ./Dockerfile
+
+default:
+  image: rust:1
+  before_script:
+    - rustc --version
+    - cargo --version
+    - rustup component add rustfmt clippy
+  cache:
+    key: "cargo-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .cargo/bin
+      - .cargo/registry/index
+      - .cargo/registry/cache
+      - .cargo/git/db
+      - target
+
+fmt:
+  stage: lint
+  script:
+    - cargo fmt --all -- --check
+
+clippy_fastembed:
+  stage: lint
+  script:
+    - cargo clippy --all-targets --locked -- -D warnings
+
+clippy_ollama:
+  stage: lint
+  script:
+    - cargo clippy --all-targets --locked --no-default-features --features ollama -- -D warnings
+
+build_fastembed:
+  stage: build
+  script:
+    - cargo build --release --locked
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - target/release/palazzo
+
+build_ollama:
+  stage: build
+  script:
+    - cargo build --release --locked --no-default-features --features ollama
+
+test:
+  stage: test
+  script:
+    - cargo test --locked
+
+cargo_audit:
+  stage: security
+  script:
+    - cargo install --locked cargo-audit
+    - cargo audit --deny warnings --ignore RUSTSEC-2024-0436
