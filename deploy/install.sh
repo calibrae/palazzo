@@ -28,8 +28,17 @@ fi
 install -d -o palazzo -g palazzo -m 0750 /var/lib/palazzo
 install -d -m 0755 /opt/palazzo /opt/palazzo/bin /etc/palazzo
 
-# Binary
+# Binary — back up the current one (named by its version) before overwriting,
+# then keep only the 2 most recent backups so /opt/palazzo/bin doesn't grow
+# unbounded (each binary is ~35 MB; this used to pile up across every deploy).
+if [[ -x /opt/palazzo/bin/palazzo ]]; then
+    cur="$(/opt/palazzo/bin/palazzo --version 2>/dev/null | awk '{print $2}')"
+    cp /opt/palazzo/bin/palazzo "/opt/palazzo/bin/palazzo.bak-${cur:-unknown}"
+fi
 install -m 0755 "$BIN" /opt/palazzo/bin/palazzo
+# Prune: keep the 2 newest backups (by mtime), drop the rest. Matches both the
+# old `palazzo.bak-pre-vX` and new `palazzo.bak-VERSION` names.
+ls -1t /opt/palazzo/bin/palazzo.bak-* 2>/dev/null | tail -n +3 | xargs -r rm -f
 
 # Env file: copy example if /etc/palazzo/env doesn't exist; never overwrite.
 if [[ ! -f /etc/palazzo/env ]]; then
