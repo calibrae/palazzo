@@ -1,6 +1,9 @@
 # Build context trimmed to what `cargo build` actually needs:
 # Cargo.toml, Cargo.lock, src/. Everything else is noise (or huge).
 target
+!target/
+!target/release/
+!target/release/palazzo
 .git
 .github
 .fastembed_cache
