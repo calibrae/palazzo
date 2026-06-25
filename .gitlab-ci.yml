@@ -77,6 +77,6 @@ test:
 cargo_audit:
   stage: security
   script:
-    - command -v cargo-audit >/dev/null 2>&1 || cargo install --locked cargo-audit
+    - test -x "$CARGO_HOME/bin/cargo-audit" || cargo install --locked cargo-audit
     - cargo audit --deny warnings --ignore RUSTSEC-2024-0436
 
