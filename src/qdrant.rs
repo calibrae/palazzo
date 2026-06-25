@@ -409,7 +409,56 @@ impl Qdrant {
     /// Ensure keyword indexes exist on wing, category, room, hall, plus a
     /// datetime index on `timestamp` for since/until range queries. Idempotent —
     /// Qdrant accepts re-creation as no-op.
+    /// Create the collection (768-dim, Cosine — the nomic contract) if it
+    /// doesn't exist yet. Idempotent: an existing collection is left untouched,
+    /// so this never affects data — it only self-provisions a fresh deployment
+    /// (any COLLECTION name) so there's no manual Qdrant step before first boot.
+    pub async fn ensure_collection(&self) -> Result<()> {
+        let url = format!("{}/collections/{}", self.base_url, self.collection);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if resp.status().is_success() {
+            return Ok(()); // already exists — do not touch
+        }
+        if resp.status() != reqwest::StatusCode::NOT_FOUND {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "check collection {}: {status} {text}",
+                self.collection
+            ));
+        }
+        tracing::warn!(
+            collection = %self.collection,
+            "collection not found — creating it (768-dim, Cosine)"
+        );
+        let body = json!({ "vectors": { "size": 768, "distance": "Cosine" } });
+        let resp = self
+            .client
+            .put(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "create collection {}: {status} {text}",
+                self.collection
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn ensure_indexes(&self) -> Result<()> {
+        // Self-provision the collection first, so a fresh deploy with any
+        // COLLECTION name works with no manual Qdrant step.
+        self.ensure_collection().await?;
         let url = self.url("/index?wait=true");
         let fields: [(&str, &str); 7] = [
             ("wing", "keyword"),
@@ -570,6 +619,33 @@ mod tests {
             "category": "technical", "wing": "projects", "room": "palazzo",
             "hall": "facts", "text": text, "timestamp": "2026-04-20T00:00:00Z",
         })
+    }
+
+    #[tokio::test]
+    async fn ensure_collection_creates_when_missing() {
+        let mock = MockQdrant::start().await;
+        mock.push(
+            "GET /collections/test",
+            json!({"__status": 404, "__body": {"status": {"error": "Not found"}}}),
+        );
+        let q = Qdrant::new(&mock.url, "test");
+        q.ensure_collection().await.unwrap();
+        let puts = mock.requests_for("PUT /collections/test");
+        assert_eq!(puts.len(), 1, "should create the missing collection");
+        assert_eq!(puts[0]["vectors"]["size"], 768);
+        assert_eq!(puts[0]["vectors"]["distance"], "Cosine");
+    }
+
+    #[tokio::test]
+    async fn ensure_collection_skips_when_exists() {
+        let mock = MockQdrant::start().await;
+        // default GET response is 200 → collection "exists"
+        let q = Qdrant::new(&mock.url, "test");
+        q.ensure_collection().await.unwrap();
+        assert!(
+            mock.requests_for("PUT /collections/test").is_empty(),
+            "must not touch an existing collection"
+        );
     }
 
     #[tokio::test]
