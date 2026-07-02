@@ -5,6 +5,7 @@ mod embeddings;
 mod mcp;
 mod oauth;
 mod qdrant;
+mod ratelimit;
 mod schema;
 #[cfg(test)]
 mod testmock;
@@ -129,6 +130,7 @@ Usage:
                                (NDJSON stream), and POST /v1/embeddings (OpenAI-compatible
                                embeddings over the shared fastembed model).
                                (default ADDR: 127.0.0.1:6334, override with PALAZZO_BIND)
+  palazzo warm                 Download/load the embedding model into FASTEMBED_CACHE_DIR and exit (bake the model into a container image at build time).
   palazzo gain [--since-secs N] [--json]
                                Render the token-savings report from PALAZZO_USAGE_LOG.
                                Defaults to all-time text rendering; --json emits the structured Summary.
@@ -183,6 +185,7 @@ async fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         None => run_stdio().await,
         Some("serve") => run_http(&args[1..]).await,
+        Some("warm") => run_warm().await,
         Some("gain") => run_gain(&args[1..]),
         Some("ingest") => run_ingest(&args[1..]).await,
         Some("--help" | "-h") => {
@@ -199,6 +202,13 @@ async fn main() -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+async fn run_warm() -> Result<()> {
+    let cfg = Config::from_env();
+    let _ = make_embedder(&cfg)?;
+    tracing::info!("fastembed model warmed into cache; exiting");
+    Ok(())
 }
 
 fn run_gain(rest: &[String]) -> Result<()> {
@@ -791,6 +801,7 @@ async fn run_http(rest: &[String]) -> Result<()> {
     // middleware when attribution is enabled. /whoami (token mint), /health,
     // /metrics, /export, and /v1/* stay open. When auth is off, no middleware
     // is added and /whoami isn't mounted (behaviour unchanged).
+    let limiter = crate::ratelimit::RateLimiter::new(60, 60);
     let mut mcp_route = axum::Router::new().nest_service("/mcp", service);
     let whoami_route = if auth.enabled() {
         mcp_route = mcp_route.layer(axum::middleware::from_fn_with_state(
@@ -807,6 +818,10 @@ async fn run_http(rest: &[String]) -> Result<()> {
                 axum::routing::get(crate::auth::whoami_get).post(crate::auth::whoami_post),
             )
             .with_state(auth.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                limiter.clone(),
+                crate::ratelimit::rate_limit,
+            ))
     } else {
         axum::Router::new()
     };
@@ -832,6 +847,10 @@ async fn run_http(rest: &[String]) -> Result<()> {
             )
             .route("/token", axum::routing::post(crate::oauth::token))
             .with_state(st)
+            .layer(axum::middleware::from_fn_with_state(
+                limiter.clone(),
+                crate::ratelimit::rate_limit,
+            ))
     } else {
         axum::Router::new()
     };

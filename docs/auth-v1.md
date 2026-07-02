@@ -159,6 +159,16 @@ and it's the "per-agent insert tracking" idea from the homelab — same field.
 
 ---
 
+## Compromise response / token revocation
+
+Palazzo's JWT tokens are stateless HS256. There is no per-token revocation list — the server does not track issued tokens.
+
+**Access tokens** default to ~1 hour TTL; **refresh tokens** default to ~90 days. If either leaks, the only remedy is key rotation: change `PALAZZO_AUTH_SIGNING_KEY` to a fresh value and restart (or redeploy). This invalidates every outstanding token simultaneously — every user must re-authenticate on their next request. Via the OAuth flow that is one browser click on the "Authenticate" button; via the `/whoami` paste path it is a revisit and re-paste. A blunt instrument (logs everyone out) but immediate and total.
+
+**Future option — per-user revoke without a global logout:** add a `jti` (JWT ID) claim to every issued token and maintain a small server-side denylist. Each verify call checks the list; revoking a user means adding their `jti`; they get a new token on next auth. Requires a fast persistent store (sled, Redis, or a `tokio::sync::RwLock<HashSet>` for single-process). Not implemented in v1 — punt until there is a concrete bad-actor case.
+
+---
+
 ## 7. Client setup (verified June 2026)
 
 ### Recommended: static bearer header (works on all three, no OAuth)

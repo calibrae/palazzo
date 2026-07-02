@@ -55,6 +55,7 @@ impl OAuthState {
 }
 
 const CODE_TTL_SECS: u64 = 600;
+const MAX_PENDING_CODES: usize = 10_000;
 
 fn now() -> u64 {
     SystemTime::now()
@@ -79,10 +80,40 @@ fn pkce_ok(verifier: &str, challenge: &str) -> bool {
 /// Only loopback (http) or https redirect targets — never an arbitrary http
 /// origin, so palazzo can't be turned into an open redirector.
 fn redirect_uri_ok(uri: &str) -> bool {
-    uri.starts_with("http://localhost")
-        || uri.starts_with("http://127.0.0.1")
-        || uri.starts_with("http://[::1]")
-        || uri.starts_with("https://")
+    // Split into scheme and the rest of the URI.
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return false;
+    };
+    // Authority is everything before the first path/query/fragment delimiter.
+    let authority = match rest.find(['/', '?', '#']) {
+        Some(pos) => &rest[..pos],
+        None => rest,
+    };
+    // Strip optional "userinfo@" prefix (take the part after the last '@').
+    let authority = if let Some(pos) = authority.rfind('@') {
+        &authority[pos + 1..]
+    } else {
+        authority
+    };
+    // Extract the host, distinguishing IPv6 literals from host[:port].
+    let host = if authority.starts_with('[') {
+        // IPv6 literal: "[::1]" or "[::1]:port"
+        let Some(end) = authority.find(']') else {
+            return false;
+        };
+        &authority[1..end]
+    } else {
+        // Hostname or IPv4: take the part before the optional ":port".
+        match authority.find(':') {
+            Some(pos) => &authority[..pos],
+            None => authority,
+        }
+    };
+    match scheme {
+        "https" => !host.is_empty(),
+        "http" => matches!(host, "localhost" | "127.0.0.1" | "::1"),
+        _ => false,
+    }
 }
 
 // ---------- discovery metadata ----------
@@ -206,19 +237,31 @@ pub async fn authorize_post(
     }
 
     let code = random_b64(32);
-    {
+    let at_capacity = {
         let mut codes = st.codes.lock().unwrap();
         let cutoff = now();
         codes.retain(|_, c| c.expires_at > cutoff); // prune expired
-        codes.insert(
-            code.clone(),
-            AuthCode {
-                email,
-                code_challenge: f.code_challenge,
-                redirect_uri: f.redirect_uri.clone(),
-                expires_at: now() + CODE_TTL_SECS,
-            },
-        );
+        if codes.len() >= MAX_PENDING_CODES {
+            true
+        } else {
+            codes.insert(
+                code.clone(),
+                AuthCode {
+                    email,
+                    code_challenge: f.code_challenge,
+                    redirect_uri: f.redirect_uri.clone(),
+                    expires_at: now() + CODE_TTL_SECS,
+                },
+            );
+            false
+        }
+    }; // lock released here
+    if at_capacity {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many pending authorizations, retry shortly\n",
+        )
+            .into_response();
     }
     let sep = if f.redirect_uri.contains('?') {
         '&'
@@ -369,6 +412,13 @@ mod tests {
         assert!(redirect_uri_ok("https://app.example.com/cb"));
         assert!(!redirect_uri_ok("http://evil.example.com/cb"));
         assert!(!redirect_uri_ok("ftp://x"));
+    }
+
+    #[test]
+    fn redirect_uri_rejects_lookalike_hosts() {
+        assert!(!redirect_uri_ok("http://localhost.evil.com/cb"));
+        assert!(!redirect_uri_ok("http://127.0.0.1.evil.com/cb"));
+        assert!(redirect_uri_ok("http://[::1]:8080/cb"));
     }
 
     #[test]

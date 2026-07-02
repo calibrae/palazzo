@@ -20,6 +20,10 @@ use crate::util::now_rfc3339;
 use crate::wal::Wal;
 
 const DUPLICATE_THRESHOLD: f32 = 0.95;
+/// How many nearest neighbours a dedup check scans. Top-1 is not enough: a
+/// *different* memory can outrank the exact duplicate on cosine, so we look a
+/// few deep for an exact-text match above threshold.
+const DUP_SEARCH_K: u32 = 5;
 /// Upper bound on stored/searched text. nomic-embed-text has ~8k token ctx; 32KB is well above
 /// what a sane memory should be, and keeps pathological inputs from flooding Ollama.
 const MAX_TEXT_BYTES: usize = 32 * 1024;
@@ -454,6 +458,14 @@ fn dedup_filter() -> FindFilter {
     }
 }
 
+/// First hit in `hits` that is an exact text match above the duplicate
+/// threshold — the dedup rule (cosine ≥ 0.95 AND identical text). Scans the
+/// whole slice, not just the top hit.
+fn exact_dup<'a>(hits: &'a [Memory], text: &str) -> Option<&'a Memory> {
+    hits.iter()
+        .find(|m| m.score.unwrap_or(0.0) >= DUPLICATE_THRESHOLD && m.text == text)
+}
+
 impl Palace {
     async fn do_store(
         &self,
@@ -476,12 +488,14 @@ impl Palace {
         let hall = validate_tag("hall", &args.hall)?;
         let vec = self.embedder.embed(&args.text).await?;
 
-        // Duplicate check — if the top hit is above threshold, skip the write and return the existing ID.
-        let existing = self.qdrant.search(vec.clone(), 1, &dedup_filter()).await?;
-        if let Some(top) = existing.first()
-            && top.score.unwrap_or(0.0) >= DUPLICATE_THRESHOLD
-            && top.text == args.text
-        {
+        // Duplicate check — scan the top-K (not just top-1): a *different*
+        // near-duplicate can outrank the exact match, so top-1 would miss it and
+        // store a second copy. Look for any exact-text hit above threshold.
+        let existing = self
+            .qdrant
+            .search(vec.clone(), DUP_SEARCH_K, &dedup_filter())
+            .await?;
+        if let Some(top) = exact_dup(&existing, &args.text) {
             tracing::info!(id = top.id, "skipping store — exact duplicate");
             return Ok(StoreResult {
                 id: top.id,
@@ -601,24 +615,26 @@ impl Palace {
             );
         }
 
-        // Per-item dedup check against the live collection. Cheap (single top-1
-        // search per item) and correct, but does serialize. For a batch of 256
-        // that's ~256 ms total round-trip on localhost Qdrant — acceptable.
+        // Per-item dedup check against the live collection. Scan top-K, not
+        // top-1: a different near-duplicate can outrank the exact match. Cheap
+        // (K-hit search per item) and correct; serializes but a 256-batch is
+        // ~sub-second round-trip on localhost Qdrant — acceptable.
         let mut dedup_status: Vec<DedupStatus> = vec![DedupStatus::Fresh; n];
         let dedup = dedup_filter();
         for (slot, &idx) in valid_indexes.iter().enumerate() {
             let vec_for_search = vectors[slot].clone();
-            let hits = match self.qdrant.search(vec_for_search, 1, &dedup).await {
+            let hits = match self
+                .qdrant
+                .search(vec_for_search, DUP_SEARCH_K, &dedup)
+                .await
+            {
                 Ok(h) => h,
                 Err(e) => {
                     item_errors[idx] = Some(format!("dedup search: {e:#}"));
                     continue;
                 }
             };
-            if let Some(top) = hits.first()
-                && top.score.unwrap_or(0.0) >= DUPLICATE_THRESHOLD
-                && top.text == args.items[idx].text
-            {
+            if let Some(top) = exact_dup(&hits, &args.items[idx].text) {
                 dedup_status[idx] = DedupStatus::Duplicate {
                     of: top.id,
                     score: top.score,
@@ -635,6 +651,12 @@ impl Palace {
         let now = now_rfc3339();
         let mut to_upsert: Vec<PointUpsert> = Vec::new();
         let mut new_ids: Vec<Option<u64>> = vec![None; n];
+        // Intra-batch dedup: the live search above can't see items earlier in
+        // *this* batch (they aren't upserted yet), so identical texts within one
+        // call would each store a copy. Track texts we've assigned an ID to and
+        // point later duplicates at the first one.
+        let mut seen_text: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
 
         for (slot, &idx) in valid_indexes.iter().enumerate() {
             if item_errors[idx].is_some() {
@@ -644,7 +666,20 @@ impl Palace {
                 continue;
             }
             let item = &args.items[idx];
+            if let Some(&first_id) = seen_text.get(&item.text) {
+                dedup_status[idx] = DedupStatus::Duplicate {
+                    of: first_id,
+                    score: None,
+                    text: item.text.clone(),
+                    wing: item.wing.trim().to_string(),
+                    room: item.room.trim().to_string(),
+                    hall: item.hall.trim().to_string(),
+                    timestamp: now.clone(),
+                };
+                continue;
+            }
             let id = new_id();
+            seen_text.insert(item.text.clone(), id);
             let payload = Payload {
                 category: item.category.trim().to_string(),
                 wing: item.wing.trim().to_string(),
@@ -922,10 +957,27 @@ impl Palace {
 
         self.qdrant.upsert(id, vec, payload).await?;
 
+        // Retrieve first: Qdrant's set_payload silently succeeds on nonexistent
+        // point IDs (transparent no-op). We must check existence ourselves before
+        // calling set_payload or we'll report ok=true for IDs that were never
+        // actually marked.
+        let retrieved = self.qdrant.retrieve(args.supersedes.clone()).await?;
+        let retrieved_map: std::collections::HashMap<u64, Memory> =
+            retrieved.into_iter().map(|m| (m.id, m)).collect();
+
         // Mark each old point. Non-atomic across points — if any patch fails,
         // we report it and leave the caller to retry with the same supersedes list.
         let mut marked = Vec::with_capacity(args.supersedes.len());
         for old_id in &args.supersedes {
+            if !retrieved_map.contains_key(old_id) {
+                tracing::warn!(id = *old_id, "supersede mark skipped — no such point");
+                marked.push(SupersededEntry {
+                    id: *old_id,
+                    ok: false,
+                    error: Some("no such point".into()),
+                });
+                continue;
+            }
             let fields = json!({
                 "valid_until": now.clone(),
                 "superseded_by": id,
@@ -2207,6 +2259,109 @@ mod tests {
             // With a half-life the fetch over-samples (limit*4, capped at 80).
             let searches = mock.requests_for("POST /points/search");
             assert_eq!(searches[0]["limit"], 20);
+        }
+
+        #[tokio::test]
+        async fn store_dedup_scans_top_k() {
+            // The top-ranked hit has a different text but still scores above threshold.
+            // A top-1 check would wrongly report "no dup found" here. The code must
+            // scan all K hits — the exact-text match lives at position 2 (id=20).
+            let mock = MockQdrant::start().await;
+            mock.push(
+                "POST /points/search",
+                json!({"result": [
+                    {"id": 10, "score": 0.99, "payload": payload_json("different text")},
+                    {"id": 20, "score": 0.96, "payload": payload_json("same text")},
+                ]}),
+            );
+            let p = test_palace(&mock.url, None);
+
+            let res = p.do_store(store_args("same text"), None).await.unwrap();
+            assert_eq!(
+                res.duplicate_of,
+                Some(20),
+                "must find exact dup at position 2, not top-1"
+            );
+            assert_eq!(res.id, 20);
+            // No upsert must have happened.
+            assert!(mock.requests_for("PUT /points").is_empty());
+        }
+
+        #[tokio::test]
+        async fn store_batch_intra_batch_dedup() {
+            // Two items with identical text in the same batch. The live-search
+            // dedup can't see the first item (it isn't upserted yet), so the
+            // intra-batch seen_text map must catch the second one.
+            let mock = MockQdrant::start().await;
+            // One empty dedup-search response per item.
+            mock.push("POST /points/search", json!({"result": []}));
+            mock.push("POST /points/search", json!({"result": []}));
+            let p = test_palace(&mock.url, None);
+
+            let res = p
+                .do_store_batch(
+                    StoreBatchArgs {
+                        items: vec![batch_item("hello"), batch_item("hello")],
+                        skip_duplicates: None,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                res.counts.stored, 1,
+                "only one of the identical texts should be stored"
+            );
+            assert_eq!(
+                res.counts.duplicates_returned, 1,
+                "second item must be reported as a duplicate"
+            );
+            // Second item points back at the first item's new ID.
+            assert!(res.items[1].duplicate_of.is_some());
+            assert_eq!(
+                res.items[0].id, res.items[1].duplicate_of,
+                "second item's duplicate_of must equal first item's new ID"
+            );
+            // Only one upsert batch, containing only the first item.
+            let upserts = mock.requests_for("PUT /points");
+            assert_eq!(upserts.len(), 1);
+            assert_eq!(upserts[0]["points"].as_array().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn supersede_missing_id_reports_not_ok() {
+            // Qdrant's set_payload silently no-ops on a nonexistent point — the
+            // fix retrieves first and reports ok=false without calling set_payload.
+            let mock = MockQdrant::start().await;
+            // No retrieve response pushed → MockQdrant default: empty result (id
+            // 999999 not found). Upsert of the new point uses the catch-all
+            // default success response.
+            let p = test_palace(&mock.url, None);
+
+            let res = p
+                .do_supersede(
+                    SupersedeArgs {
+                        supersedes: vec![999999],
+                        text: "corrected text".into(),
+                        category: "technical".into(),
+                        wing: "projects".into(),
+                        room: "palazzo".into(),
+                        hall: "facts".into(),
+                        session: None,
+                        source_file: None,
+                        reason: "test — point never existed".into(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(res.marked.len(), 1);
+            assert!(!res.marked[0].ok, "missing point must report ok=false");
+            assert_eq!(res.marked[0].error.as_deref(), Some("no such point"));
+            // set_payload must not have been called for the missing id.
+            assert!(mock.requests_for("POST /points/payload").is_empty());
         }
     }
 }

@@ -1,7 +1,21 @@
 # syntax=docker/dockerfile:1
 
-# Runtime-only image build for CI/cloud use.
+# Multi-stage: stage 1 warms the fastembed model cache at image-build time
+# so the container needs no HuggingFace egress at runtime.
 # Expects a prebuilt binary in the build context at: target/release/palazzo
+
+FROM debian:trixie-slim AS model
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY target/release/palazzo /usr/local/bin/palazzo
+
+ENV FASTEMBED_CACHE_DIR=/model-cache
+
+RUN palazzo warm
+
 FROM debian:trixie-slim
 
 RUN apt-get update \
@@ -10,6 +24,9 @@ RUN apt-get update \
  && useradd --system --create-home --home-dir /var/lib/palazzo palazzo
 
 COPY target/release/palazzo /usr/local/bin/palazzo
+COPY --from=model /model-cache /var/lib/palazzo/fastembed-cache
+
+RUN chown -R palazzo:palazzo /var/lib/palazzo
 
 ENV PALAZZO_BIND=0.0.0.0:6334 \
     QDRANT_URL=http://qdrant:6333 \

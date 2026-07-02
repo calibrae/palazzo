@@ -115,6 +115,10 @@ impl AuthConfig {
         }
     }
 
+    pub(crate) fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
     pub(crate) fn access_ttl_secs(&self) -> u64 {
         self.access_ttl_secs
     }
@@ -284,7 +288,13 @@ pub async fn whoami_post(
             .into_response();
     }
     let token = cfg.mint(&email);
-    Html(token_page(&email, &token, &base_url(&headers))).into_response()
+    Html(token_page(
+        &email,
+        &token,
+        &base_url(&headers),
+        cfg.ttl_secs(),
+    ))
+    .into_response()
 }
 
 /// Best-effort public base URL for the example commands, from the request: the
@@ -321,10 +331,21 @@ style=\"padding:.5rem;width:20rem;font-size:1rem\">\
 <button type=submit style=\"padding:.5rem 1rem;font-size:1rem\">Get token</button>\
 </form></body>";
 
-fn token_page(email: &str, token: &str, base: &str) -> String {
+fn token_page(email: &str, token: &str, base: &str, ttl_secs: u64) -> String {
     // Full token embedded in every copy target — the buttons copy exactly what
     // you'd paste, token and all. Built here, escaped for display; the copy JS
     // reads textContent/value (entities decoded) so the clipboard gets raw text.
+    let days = ttl_secs / 86400;
+    let validity = if days >= 1 {
+        format!("~{days} days")
+    } else {
+        let hours = ttl_secs / 3600;
+        if hours >= 1 {
+            format!("~{hours} hours")
+        } else {
+            "a limited time".to_string()
+        }
+    };
     let claude = format!(
         "claude mcp add --transport http palazzo {base}/mcp --header \"Authorization: Bearer {token}\""
     );
@@ -336,6 +357,7 @@ fn token_page(email: &str, token: &str, base: &str) -> String {
         .replace("__TOKEN__", &html_escape(token))
         .replace("__CLAUDE__", &html_escape(&claude))
         .replace("__OPENCODE__", &html_escape(&opencode))
+        .replace("__VALIDITY__", &validity)
 }
 
 const TOKEN_PAGE_TMPL: &str = r##"<!doctype html><meta charset=utf-8><title>palazzo — token</title>
@@ -351,7 +373,7 @@ h3{margin-top:1.6rem}
 </style>
 <body>
 <h2>Token for __EMAIL__</h2>
-<p>Paste as <code>Authorization: Bearer &lt;token&gt;</code> in your MCP client. Valid ~30 days; revisit when it expires.</p>
+<p>Paste as <code>Authorization: Bearer &lt;token&gt;</code> in your MCP client. Valid __VALIDITY__; revisit when it expires.</p>
 <div class=row><button class=copy data-target=tok>Copy token</button>
 <textarea id=tok readonly rows=3>__TOKEN__</textarea></div>
 <h3>Claude Code</h3>
