@@ -7,3 +7,6 @@ resume.sh
 .fastembed_cache/
 .env
 .mcp.json
+
+# internal dev notes — keep out of the public GitHub mirror
+inbox/
