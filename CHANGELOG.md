@@ -7,6 +7,11 @@ lives in the git log.
 
 ## Unreleased
 
+- **fix(deps): bump `crossbeam-epoch` 0.9.18 → 0.9.20** — RUSTSEC-2026-0204
+  (invalid pointer deref in the `fmt::Pointer` impl for `Atomic`/`Shared`).
+  Semver-compatible patch bump; clears the `cargo_audit` gate that had been
+  failing the CI `security` stage since early July and skipping `package` +
+  the ArgoCD `deploy`.
 - **feat: `GET /find` REST endpoint** — HTTP sibling of the `palace_find` MCP
   tool. Semantic search over the palace for non-MCP clients (built for the fugo
   workflow engine's palazzo RAG node). Query params map 1:1 to `palace_find`
