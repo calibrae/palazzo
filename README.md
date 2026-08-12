@@ -213,6 +213,32 @@ The response is **streamed NDJSON** — one progress line per processed batch (d
 
 Each per-chunk progress line carries a `dedup_against` array — the existing point IDs that the chunk's items matched (cosine ≥ 0.95 + exact text). Empty when no dedup hits; non-empty when `counts.duplicates_returned > 0`. Use this to distinguish "all items deduplicated against existing memories" from "nothing happened". Use `curl -N` to disable client-side buffering and watch progress live. Errors during processing emit a `{"chunk":N,"error":"..."}` line and close the stream. Body parse failures still return `400` with a plain-text body before any streaming starts.
 
+### Semantic search over HTTP (`GET /find`)
+
+The HTTP sibling of the `palace_find` MCP tool — semantic search over the palace for clients that speak plain HTTP rather than MCP (e.g. a workflow-engine node). Same server-side embedding (fastembed `nomic-embed-text-v1.5`) and the same filters as `palace_find`; no client-side embedding needed.
+
+```
+curl 'http://palazzo-host:6334/find?query=vault%20token%20handling&limit=5&wing=infrastructure'
+```
+
+Query params:
+- `query` — **required**, the natural-language search string (max 32 KB)
+- `limit` — optional, default **10**, clamped to `1..=20`
+- `wing`, `category`, `room`, `hall` — optional exact-match facet filters
+- `author` — optional exact-match (the email stamped at write time; lowercased to match)
+- `since`, `until` — optional RFC3339 second-precision UTC bounds (e.g. `2026-04-20T00:00:00Z`)
+- `recency_half_life_days` — optional float; re-ranks by `score · exp(-age_days / half_life)`. Omit or `0` for pure cosine.
+- `include_superseded` — optional bool, default **false**
+
+Returns a JSON **array** of hits (relevance-ordered), each in the `Memory` shape:
+
+```
+[{"id":1777152233431,"score":0.63,"text":"…","category":"project","wing":"projects",
+  "room":"palazzo","hall":"decisions","timestamp":"2026-04-25T21:23:53Z","session":"…"}]
+```
+
+Core fields (`id`, `score`, `text`, `wing`/`room`/`hall`/`category`, `timestamp`) are always present; optional fields (`author`, `session`, `source_file`, and supersede metadata) appear only when set. A missing/oversized `query` or a malformed param returns `400` (plain text). Gated by the bearer middleware when `PALAZZO_AUTH=email` (like `/ingest` and `/mcp`), open when auth is off.
+
 ### Export collection as NDJSON (`GET /export`)
 
 Stream the entire collection (or filtered subset) as **NDJSON**, one point per line. Pagination via Qdrant's scroll API keeps memory bounded:

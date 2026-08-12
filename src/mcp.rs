@@ -814,7 +814,7 @@ impl Palace {
         BatchStoreResult { items, counts }
     }
 
-    async fn do_find(&self, args: FindArgs) -> anyhow::Result<Vec<Memory>> {
+    pub(crate) async fn do_find(&self, args: FindArgs) -> anyhow::Result<Vec<Memory>> {
         if args.query.len() > MAX_TEXT_BYTES {
             anyhow::bail!(
                 "query too large: {} bytes (max {})",

@@ -465,6 +465,27 @@ async fn ingest_handler(
         .unwrap()
 }
 
+/// GET /find handler. HTTP sibling of the palace_find MCP tool: semantic search
+/// over the palace via the same server-side fastembed embed + Qdrant search path,
+/// with the same filters. Query params map 1:1 to FindArgs
+/// (query required; wing/category/room/hall/since/until/limit/
+/// recency_half_life_days/include_superseded optional). Returns a JSON array of
+/// hits in the Memory shape (id, score, text, wing/room/hall/category, timestamp,
+/// plus any optional fields). Auth-gated when PALAZZO_AUTH=email, open otherwise.
+async fn find_handler(
+    axum::extract::State(palace): axum::extract::State<std::sync::Arc<Palace>>,
+    axum::extract::Query(mut args): axum::extract::Query<crate::mcp::FindArgs>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // REST default limit is 10 (the MCP tool defaults to 5); do_find clamps 1..=20.
+    args.limit.get_or_insert(10);
+    metrics::counter!("palazzo_http_find_total").increment(1);
+    match palace.do_find(args).await {
+        Ok(hits) => axum::Json(hits).into_response(),
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, format!("{e:#}\n")).into_response(),
+    }
+}
+
 struct HealthState {
     qdrant_up: Arc<AtomicBool>,
 }
@@ -771,6 +792,12 @@ async fn run_http(rest: &[String]) -> Result<()> {
     let mut ingest_route = axum::Router::new()
         .route("/ingest", axum::routing::post(ingest_handler))
         .layer(axum::extract::DefaultBodyLimit::max(max_ingest))
+        .with_state(ingest_palace.clone());
+    // GET /find — HTTP sibling of palace_find (semantic search). Shares the same
+    // Palace (embedder + Qdrant) as /ingest. Gated by require_auth when
+    // PALAZZO_AUTH=email (like /ingest and /mcp), open when auth is off.
+    let mut find_route = axum::Router::new()
+        .route("/find", axum::routing::get(find_handler))
         .with_state(ingest_palace);
     let health_route = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
@@ -809,6 +836,10 @@ async fn run_http(rest: &[String]) -> Result<()> {
             crate::auth::require_auth,
         ));
         ingest_route = ingest_route.layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_auth,
+        ));
+        find_route = find_route.layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             crate::auth::require_auth,
         ));
@@ -858,6 +889,7 @@ async fn run_http(rest: &[String]) -> Result<()> {
     let router = axum::Router::new()
         .merge(mcp_route)
         .merge(ingest_route)
+        .merge(find_route)
         .merge(health_route)
         .merge(export_route)
         .merge(metrics_route)
@@ -868,7 +900,7 @@ async fn run_http(rest: &[String]) -> Result<()> {
         .await
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!(
-        "listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /export (NDJSON stream), POST /v1/embeddings + GET /v1/models (OpenAI-compatible){}",
+        "listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /find (semantic search), GET /export (NDJSON stream), POST /v1/embeddings + GET /v1/models (OpenAI-compatible){}",
         if auth.enabled() {
             ", GET/POST /whoami (token mint)"
         } else {
