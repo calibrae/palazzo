@@ -1281,7 +1281,7 @@ impl Palace {
         self.qdrant.retrieve(args.ids).await
     }
 
-    async fn do_status(&self) -> anyhow::Result<serde_json::Value> {
+    pub(crate) async fn do_status(&self) -> anyhow::Result<serde_json::Value> {
         let total = self.qdrant.count(&FindFilter::default()).await?;
         let wings = self.qdrant.facet("wing").await?;
         let halls = self.qdrant.facet("hall").await?;

@@ -7,6 +7,11 @@ lives in the git log.
 
 ## Unreleased
 
+- **feat: `GET /stats` endpoint** — JSON palace stats (the `palace_status` view over
+  HTTP): `collection`, `total`, facet counts by `wings`/`halls`/`categories`, plus
+  `version` and `embedder`. Reuses `do_status`; shares the `/ingest` Palace. Auth-gated
+  when `PALAZZO_AUTH=email`, open otherwise. Returns 503 if Qdrant is down. (`GET
+  /metrics` remains the Prometheus scrape endpoint for time-series.)
 - **feat!: migrate MCP transport to vanilla rmcp 3.1.2** — drop the `calibrae/rmcp`
   fork + the `[patch.crates-io]` pin. `legacy_session_mode` stays ON by default
   (stateful): access logs show ~997 real `GET /mcp` SSE-stream opens from live Claude

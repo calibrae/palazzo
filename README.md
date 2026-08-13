@@ -239,6 +239,24 @@ Returns a JSON **array** of hits (relevance-ordered), each in the `Memory` shape
 
 Core fields (`id`, `score`, `text`, `wing`/`room`/`hall`/`category`, `timestamp`) are always present; optional fields (`author`, `session`, `source_file`, and supersede metadata) appear only when set. A missing/oversized `query` or a malformed param returns `400` (plain text). Gated by the bearer middleware when `PALAZZO_AUTH=email` (like `/ingest` and `/mcp`), open when auth is off.
 
+### Palace stats as JSON (`GET /stats`)
+
+A JSON snapshot of the palace — the `palace_status` view over HTTP, plus the running version and embedder backend:
+
+```
+curl http://palazzo-host:6334/stats
+```
+
+```
+{"collection":"claude-memory","total":3353,
+ "wings":{"projects":143,"infrastructure":17,"nexpublica":14,...},
+ "halls":{"facts":111,"events":55,"decisions":20,...},
+ "categories":{"technical":...,"project":...,...},
+ "version":"0.14.2","embedder":"fastembed:NomicEmbedTextV15Q"}
+```
+
+Gated by the bearer middleware when `PALAZZO_AUTH=email` (like `/find`, `/ingest`, `/mcp`), open when auth is off. Returns `503` if Qdrant is unreachable. For time-series scrape metrics (tool-call counts, latencies, embed/ingest durations) use `GET /metrics` (Prometheus) instead — `/stats` is a point-in-time palace snapshot, not a metrics feed.
+
 ### Export collection as NDJSON (`GET /export`)
 
 Stream the entire collection (or filtered subset) as **NDJSON**, one point per line. Pagination via Qdrant's scroll API keeps memory bounded:

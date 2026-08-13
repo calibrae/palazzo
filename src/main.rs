@@ -486,6 +486,30 @@ async fn find_handler(
     }
 }
 
+/// GET /stats handler. JSON palace stats — the palace_status view over HTTP:
+/// `collection`, `total` point count, and facet counts by `wings`/`halls`/
+/// `categories`, plus the running `version` and `embedder` backend. Reuses
+/// do_status; shares the /ingest Palace. Auth-gated when PALAZZO_AUTH=email.
+async fn stats_handler(
+    axum::extract::State(palace): axum::extract::State<std::sync::Arc<Palace>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match palace.do_status().await {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("version".into(), env!("CARGO_PKG_VERSION").into());
+                obj.insert("embedder".into(), BACKEND.into());
+            }
+            axum::Json(v).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("{e:#}\n"),
+        )
+            .into_response(),
+    }
+}
+
 struct HealthState {
     qdrant_up: Arc<AtomicBool>,
 }
@@ -811,6 +835,12 @@ async fn run_http(rest: &[String]) -> Result<()> {
     // PALAZZO_AUTH=email (like /ingest and /mcp), open when auth is off.
     let mut find_route = axum::Router::new()
         .route("/find", axum::routing::get(find_handler))
+        .with_state(ingest_palace.clone());
+    // GET /stats — JSON palace stats (palace_status over HTTP): collection, total,
+    // facet counts by wing/hall/category, + version & embedder. Shares the Palace;
+    // gated like /find (auth when PALAZZO_AUTH=email, open otherwise).
+    let mut stats_route = axum::Router::new()
+        .route("/stats", axum::routing::get(stats_handler))
         .with_state(ingest_palace);
     let health_route = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
@@ -837,10 +867,10 @@ async fn run_http(rest: &[String]) -> Result<()> {
         )
         .with_state(embed_for_v1);
 
-    // MCP and ingest are the write surfaces — gate them with the bearer
-    // middleware when attribution is enabled. /whoami (token mint), /health,
-    // /metrics, /export, and /v1/* stay open. When auth is off, no middleware
-    // is added and /whoami isn't mounted (behaviour unchanged).
+    // MCP, ingest, find, and stats are gated with the bearer middleware when
+    // attribution is enabled. /whoami (token mint), /health, /metrics, /export,
+    // and /v1/* stay open. When auth is off, no middleware is added and /whoami
+    // isn't mounted (behaviour unchanged).
     let limiter = crate::ratelimit::RateLimiter::new(60, 60);
     let mut mcp_route = axum::Router::new().nest_service("/mcp", service);
     let whoami_route = if auth.enabled() {
@@ -853,6 +883,10 @@ async fn run_http(rest: &[String]) -> Result<()> {
             crate::auth::require_auth,
         ));
         find_route = find_route.layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_auth,
+        ));
+        stats_route = stats_route.layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             crate::auth::require_auth,
         ));
@@ -903,6 +937,7 @@ async fn run_http(rest: &[String]) -> Result<()> {
         .merge(mcp_route)
         .merge(ingest_route)
         .merge(find_route)
+        .merge(stats_route)
         .merge(health_route)
         .merge(export_route)
         .merge(metrics_route)
@@ -913,7 +948,7 @@ async fn run_http(rest: &[String]) -> Result<()> {
         .await
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!(
-        "listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /find (semantic search), GET /export (NDJSON stream), POST /v1/embeddings + GET /v1/models (OpenAI-compatible){}",
+        "listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /find (semantic search), GET /stats (JSON stats), GET /export (NDJSON stream), POST /v1/embeddings + GET /v1/models (OpenAI-compatible){}",
         if auth.enabled() {
             ", GET/POST /whoami (token mint)"
         } else {
