@@ -304,7 +304,7 @@ impl Palace {
                 metrics::counter!("palazzo_tool_calls_total", "tool" => tool, "status" => "ok")
                     .increment(1);
                 metrics::histogram!("palazzo_tool_duration_seconds", "tool" => tool).record(secs);
-                Ok(CallToolResult::success(vec![Content::text(body)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -1437,7 +1437,7 @@ impl ServerHandler for Palace {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_server_info(Implementation::from_build_env())
-        .with_protocol_version(ProtocolVersion::LATEST)
+        .with_protocol_version(ProtocolVersion::V_2025_11_25)
         .with_instructions(
             "palazzo — Cali's memory palace over MCP. \
              Every memory is filed under four free-text labels — category, wing, room, hall — \

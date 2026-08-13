@@ -20,7 +20,7 @@ fastembed = ["dep:fastembed"]
 ollama = []
 
 [dependencies]
-rmcp = { version = "1.5", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.1", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "signal", "sync", "net"] }
 tokio-util = "0.7"
 async-stream = "0.3"
@@ -50,8 +50,3 @@ getrandom = "0.2"
 lto = "thin"
 codegen-units = 1
 strip = true
-
-[patch.crates-io]
-# Pinned to a rev (not the branch) so fresh lockfiles and `cargo update` can't
-# silently pick up new commits — feat/auto-accept-sessions head as of 2026-06-10.
-rmcp = { git = "https://github.com/calibrae/rmcp", rev = "fc7d3177e98075e6fb99e30533f9760477fb80e0" }

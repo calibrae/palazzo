@@ -698,9 +698,21 @@ async fn run_http(rest: &[String]) -> Result<()> {
 
     let ct = CancellationToken::new();
     let ct_child = ct.child_token();
+    // Legacy session mode ON by default (stateful). mista's access logs show ~997
+    // real GET /mcp standalone-SSE-stream opens from live Claude Code clients; going
+    // sessionless (false) 405s those, and we can't prove at-scale that every client
+    // degrades gracefully — so we serve them. Modern 2026-07-28 clients still get the
+    // stateless path regardless (the flag only governs legacy clients). Cost of true:
+    // the redeploy-404 blip returns (a legacy client's stale Mcp-Session-Id 404s once
+    // after a restart, then it re-initializes) — accept_unknown_sessions is gone for
+    // good, so that transient is owned permanently. Set PALAZZO_LEGACY_SESSION_MODE=false
+    // to try sessionless without a rebuild once client 405-on-GET handling is confirmed.
+    let legacy_session_mode = std::env::var("PALAZZO_LEGACY_SESSION_MODE")
+        .map(|v| !matches!(v.trim(), "false" | "0" | "off"))
+        .unwrap_or(true);
     let mut http_config = StreamableHttpServerConfig::default()
         .with_cancellation_token(ct_child)
-        .with_accept_unknown_sessions(true);
+        .with_legacy_session_mode(legacy_session_mode);
     match std::env::var("PALAZZO_ALLOWED_HOSTS") {
         Ok(raw) if raw.trim() == "*" => {
             tracing::warn!(
@@ -730,27 +742,28 @@ async fn run_http(rest: &[String]) -> Result<()> {
     // regardless of how many concurrent sessions are open. Per-session Palace
     // instances each hold a clone of this same Arc — no additional model loads.
     let shared_embedder = make_embedder(&cfg)?;
-    let ingest_palace =
-        std::sync::Arc::new(cfg.make_palace_with_embedder(shared_embedder.clone())?);
-    // Clone for the /v1/embeddings route before the original is moved into the
-    // MCP factory closure. Embedder::Clone shares the inner model Arc — still one
-    // TextEmbedding in memory.
+    // Build ONE Palace and share it everywhere. Every field (embedder/qdrant/wal/
+    // tracker) is Arc-backed, so `Palace: Clone` is a cheap Arc-bump and all clones
+    // share the same Qdrant client, WAL, tracker and embedder. This is load-bearing
+    // under rmcp 3.x's stateless streamable-HTTP transport: the service factory runs
+    // per REQUEST, so building a Palace per call would spin up a fresh reqwest/Qdrant
+    // client on every tool call. Build once, clone in.
+    let palace = cfg.make_palace_with_embedder(shared_embedder.clone())?;
+    let ingest_palace = std::sync::Arc::new(palace.clone());
+    // Clone for the /v1/embeddings route. Embedder::Clone shares the inner model Arc.
     let embed_for_v1 = shared_embedder.clone();
     let cfg = std::sync::Arc::new(cfg);
-    let mcp_cfg = cfg.clone();
-    let mcp_embedder = shared_embedder;
-    // Disable the session activity timeout. rmcp's default is 5 min — agents
-    // idle longer than that between tool calls get 404 Session not found.
-    // Zombie sessions from crashed clients are cheap (one idle tokio task + a
-    // HashMap entry) and cleared on the next server restart / deployment.
+    // The factory returns a fresh Palace handle per request — a cheap clone of the
+    // shared one. No idle-session TTL: rmcp's default keep_alive is 300s, after which
+    // an idle session is evicted and the client's next call 404s (agents idle between
+    // tool calls — the "lose MCP mid-insertion" annoyance). With keep_alive=None a
+    // session ends only when the process restarts, so the sole 404 window is a
+    // redeploy/crash. Zombie sessions from crashed clients are cheap (one HashMap
+    // entry) and cleared on the next restart. (No-op when legacy_session_mode=false.)
     let mut session_mgr = LocalSessionManager::default();
     session_mgr.session_config.keep_alive = None;
     let service = StreamableHttpService::new(
-        move || {
-            mcp_cfg
-                .make_palace_with_embedder(mcp_embedder.clone())
-                .map_err(std::io::Error::other)
-        },
+        move || Ok(palace.clone()),
         std::sync::Arc::new(session_mgr),
         http_config,
     );

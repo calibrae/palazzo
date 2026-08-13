@@ -7,6 +7,17 @@ lives in the git log.
 
 ## Unreleased
 
+- **feat!: migrate MCP transport to vanilla rmcp 3.1.2** — drop the `calibrae/rmcp`
+  fork + the `[patch.crates-io]` pin. `legacy_session_mode` stays ON by default
+  (stateful): access logs show ~997 real `GET /mcp` SSE-stream opens from live Claude
+  Code clients, which sessionless would 405 — so we keep serving them; modern
+  2026-07-28 clients get the stateless path regardless (the flag only governs legacy
+  clients). Override with `PALAZZO_LEGACY_SESSION_MODE=false` for sessionless without
+  a rebuild. The retired fork's `accept_unknown_sessions` is gone, so the redeploy-404
+  blip returns (a stale session 404s once, then the client re-initializes) — accepted.
+  Pins `ProtocolVersion::V_2025_11_25`. One shared `Palace` built once and cloned per
+  request (shared embedder/qdrant/wal/tracker), required under the per-request factory.
+  `Content`→`ContentBlock` (3.x rename).
 - **fix(deps): bump `crossbeam-epoch` 0.9.18 → 0.9.20** — RUSTSEC-2026-0204
   (invalid pointer deref in the `fmt::Pointer` impl for `Atomic`/`Shared`).
   Semver-compatible patch bump; clears the `cargo_audit` gate that had been
