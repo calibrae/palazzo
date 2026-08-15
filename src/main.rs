@@ -597,6 +597,7 @@ async fn export_handler(
         since: params.since,
         until: params.until,
         exclude_superseded_before,
+        ..FindFilter::default()
     };
 
     metrics::counter!("palazzo_export_requests_total").increment(1);

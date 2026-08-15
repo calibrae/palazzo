@@ -41,8 +41,8 @@ Neither upstream is vendored. Both are linked above; please follow and star thei
 
 | Tool | What it does |
 |---|---|
-| `palace_store` | File a verbatim memory into a wing/room/hall. Returns a new point ID or the existing one on near-duplicate. |
-| `palace_find` | Semantic search. Optional typed filters: `wing`, `category`, `room`, `hall`, `since`, `until`, `recency_half_life_days`. |
+| `palace_store` | File a verbatim memory into a wing/room/hall. Accepts an optional `event_time` (the original event time, e.g. an email's Date header) alongside the always-write-time `timestamp`. Returns a new point ID or the existing one on near-duplicate. |
+| `palace_find` | Semantic search. Optional typed filters: `wing`, `category`, `room`, `hall`, `since`, `until`, `time_field`, `recency_half_life_days`. |
 | `palace_recall` | Fetch by explicit IDs. Cheap — no embedding. |
 | `palace_status` | Total point count plus facet breakdown by wing, hall, category. |
 | `palace_taxonomy` | Flat facet dump of wing / room / hall / category counts. |
@@ -57,10 +57,15 @@ Input caps: 32 KB per text body, 100 IDs per recall batch, 1–20 results per fi
 
 ### Temporal filtering on `palace_find`
 
-- `since` / `until` — inclusive RFC3339 second-precision UTC timestamps (e.g. `2026-04-01T00:00:00Z`). Filter memories by when they were stored. Bad format is rejected with an explicit error.
-- `recency_half_life_days` (f64) — opt-in recency bias. When set, palazzo fetches up to 4× the requested limit from Qdrant (capped at 80), re-ranks each hit by `score × exp(-age_days / half_life)`, then returns the top `limit`. Omit or pass `0` for pure cosine. Typical values: `30` (aggressive), `90` (moderate), `365` (gentle — a year-old memory gets half its raw score).
+- `since` / `until` — inclusive RFC3339 second-precision UTC timestamps (e.g. `2026-04-01T00:00:00Z`). Filter memories by `time_field` (see below). Bad format is rejected with an explicit error.
+- `time_field` — which timestamp `since`/`until` and `recency_half_life_days` operate on: `"timestamp"` (default — when the memory was written) or `"event_time"` (when the underlying event actually happened, e.g. an email's Date header). Omit for today's default behavior; any other value is rejected. Under `time_field="event_time"`, a `since`/`until` range naturally excludes points with no `event_time` set (Qdrant range conditions only match points that have the key), and such points get no recency boost.
+- `recency_half_life_days` (f64) — opt-in recency bias. When set, palazzo fetches up to 4× the requested limit from Qdrant (capped at 80), re-ranks each hit by `score × exp(-age_days / half_life)` against `time_field`, then returns the top `limit`. Omit or pass `0` for pure cosine. Typical values: `30` (aggressive), `90` (moderate), `365` (gentle — a year-old memory gets half its raw score).
 
-Both knobs work alongside the wing/category/room/hall filters — they compose.
+These knobs work alongside the wing/category/room/hall filters — they compose.
+
+### Original event time (`event_time`)
+
+`timestamp` is always stamped when a memory is written and never repurposed. `palace_store`, `palace_store_batch`, and `POST /ingest` also accept an optional `event_time` — an RFC3339 second-precision UTC timestamp for when the underlying event actually happened (e.g. an email's Date header when ingesting a comms archive), independent of when it was filed into the palace. Omit it when there's no meaningful original time: nothing is written to the point's payload (Qdrant is schemaless per-point), so old memories and anything without `event_time` are simply absent the key — there is no backfill. Use `time_field="event_time"` on `palace_find`/`GET /find` to query and rerank by it instead of `timestamp`.
 
 ### Destructive operations
 
@@ -91,7 +96,9 @@ wing:        free-text — conventionally projects | infrastructure | personal |
 room:        free-text (project or topic)
 hall:        free-text — conventionally facts | events | decisions | discoveries | preferences
 text:        the memory itself, verbatim
-timestamp:   RFC3339 UTC
+timestamp:   RFC3339 UTC — always write time, never repurposed
+event_time:  optional RFC3339 UTC — the original event time (e.g. an email's Date
+             header), when there is one; absent (no backfill) otherwise
 session:     optional conversation identifier
 source_file: optional MD path when imported
 ```
@@ -227,7 +234,8 @@ Query params:
 - `wing`, `category`, `room`, `hall` — optional exact-match facet filters
 - `author` — optional exact-match (the email stamped at write time; lowercased to match)
 - `since`, `until` — optional RFC3339 second-precision UTC bounds (e.g. `2026-04-20T00:00:00Z`)
-- `recency_half_life_days` — optional float; re-ranks by `score · exp(-age_days / half_life)`. Omit or `0` for pure cosine.
+- `time_field` — optional, `"timestamp"` (default) or `"event_time"`; selects which field `since`/`until` and `recency_half_life_days` operate on. Any other value returns `400`.
+- `recency_half_life_days` — optional float; re-ranks by `score · exp(-age_days / half_life)` against `time_field`. Omit or `0` for pure cosine.
 - `include_superseded` — optional bool, default **false**
 
 Returns a JSON **array** of hits (relevance-ordered), each in the `Memory` shape:
@@ -237,7 +245,7 @@ Returns a JSON **array** of hits (relevance-ordered), each in the `Memory` shape
   "room":"palazzo","hall":"decisions","timestamp":"2026-04-25T21:23:53Z","session":"…"}]
 ```
 
-Core fields (`id`, `score`, `text`, `wing`/`room`/`hall`/`category`, `timestamp`) are always present; optional fields (`author`, `session`, `source_file`, and supersede metadata) appear only when set. A missing/oversized `query` or a malformed param returns `400` (plain text). Gated by the bearer middleware when `PALAZZO_AUTH=email` (like `/ingest` and `/mcp`), open when auth is off.
+Core fields (`id`, `score`, `text`, `wing`/`room`/`hall`/`category`, `timestamp`) are always present; optional fields (`event_time`, `author`, `session`, `source_file`, and supersede metadata) appear only when set. A missing/oversized `query` or a malformed param returns `400` (plain text). Gated by the bearer middleware when `PALAZZO_AUTH=email` (like `/ingest` and `/mcp`), open when auth is off.
 
 ### Palace stats as JSON (`GET /stats`)
 

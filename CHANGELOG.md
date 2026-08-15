@@ -7,6 +7,16 @@ lives in the git log.
 
 ## Unreleased
 
+- **feat: nullable `event_time` on stored memories + `time_field` selector on `palace_find`/`GET /find`** —
+  `palace_store`/`palace_store_batch`/`POST /ingest` accept an optional `event_time`
+  (RFC3339), the original time the underlying event happened (e.g. an email's Date
+  header), independent of `timestamp` (still always the write-time stamp, unchanged).
+  Omitted `event_time` writes no key to Qdrant — old points are untouched, no backfill.
+  `palace_find`/`GET /find` gain `time_field` ("timestamp" default, or "event_time") to
+  redirect `since`/`until` range filtering and the recency re-rank onto whichever field
+  you mean; `since`/`until` with `time_field=event_time` naturally excludes points with
+  no `event_time` set, and such points get no recency boost. Default behavior is
+  byte-for-byte unchanged.
 - **feat: `GET /stats` endpoint** — JSON palace stats (the `palace_status` view over
   HTTP): `collection`, `total`, facet counts by `wings`/`halls`/`categories`, plus
   `version` and `embedder`. Reuses `do_status`; shares the `/ingest` Palace. Auth-gated
