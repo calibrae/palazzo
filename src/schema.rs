@@ -17,6 +17,11 @@ pub struct Payload {
     pub hall: String,
     pub text: String,
     pub timestamp: String,
+    /// RFC3339 — the original time the underlying event happened (e.g. an
+    /// email's Date header), as distinct from `timestamp` (always write time).
+    /// Absent when there's no meaningful original time — never backfilled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,6 +64,10 @@ pub struct Memory {
     pub room: String,
     pub hall: String,
     pub timestamp: String,
+    /// RFC3339 — the original time the underlying event happened (e.g. an
+    /// email's Date header). Absent when unset — see `Payload::event_time`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,6 +96,8 @@ pub struct ExportPoint {
     pub room: String,
     pub hall: String,
     pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

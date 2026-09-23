@@ -465,6 +465,51 @@ async fn ingest_handler(
         .unwrap()
 }
 
+/// GET /find handler. HTTP sibling of the palace_find MCP tool: semantic search
+/// over the palace via the same server-side fastembed embed + Qdrant search path,
+/// with the same filters. Query params map 1:1 to FindArgs
+/// (query required; wing/category/room/hall/since/until/limit/
+/// recency_half_life_days/include_superseded optional). Returns a JSON array of
+/// hits in the Memory shape (id, score, text, wing/room/hall/category, timestamp,
+/// plus any optional fields). Auth-gated when PALAZZO_AUTH=email, open otherwise.
+async fn find_handler(
+    axum::extract::State(palace): axum::extract::State<std::sync::Arc<Palace>>,
+    axum::extract::Query(mut args): axum::extract::Query<crate::mcp::FindArgs>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // REST default limit is 10 (the MCP tool defaults to 5); do_find clamps 1..=20.
+    args.limit.get_or_insert(10);
+    metrics::counter!("palazzo_http_find_total").increment(1);
+    match palace.do_find(args).await {
+        Ok(hits) => axum::Json(hits).into_response(),
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, format!("{e:#}\n")).into_response(),
+    }
+}
+
+/// GET /stats handler. JSON palace stats — the palace_status view over HTTP:
+/// `collection`, `total` point count, and facet counts by `wings`/`halls`/
+/// `categories`, plus the running `version` and `embedder` backend. Reuses
+/// do_status; shares the /ingest Palace. Auth-gated when PALAZZO_AUTH=email.
+async fn stats_handler(
+    axum::extract::State(palace): axum::extract::State<std::sync::Arc<Palace>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match palace.do_status().await {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("version".into(), env!("CARGO_PKG_VERSION").into());
+                obj.insert("embedder".into(), BACKEND.into());
+            }
+            axum::Json(v).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("{e:#}\n"),
+        )
+            .into_response(),
+    }
+}
+
 struct HealthState {
     qdrant_up: Arc<AtomicBool>,
 }
@@ -552,6 +597,7 @@ async fn export_handler(
         since: params.since,
         until: params.until,
         exclude_superseded_before,
+        ..FindFilter::default()
     };
 
     metrics::counter!("palazzo_export_requests_total").increment(1);
@@ -677,9 +723,21 @@ async fn run_http(rest: &[String]) -> Result<()> {
 
     let ct = CancellationToken::new();
     let ct_child = ct.child_token();
+    // Legacy session mode ON by default (stateful). mista's access logs show ~997
+    // real GET /mcp standalone-SSE-stream opens from live Claude Code clients; going
+    // sessionless (false) 405s those, and we can't prove at-scale that every client
+    // degrades gracefully — so we serve them. Modern 2026-07-28 clients still get the
+    // stateless path regardless (the flag only governs legacy clients). Cost of true:
+    // the redeploy-404 blip returns (a legacy client's stale Mcp-Session-Id 404s once
+    // after a restart, then it re-initializes) — accept_unknown_sessions is gone for
+    // good, so that transient is owned permanently. Set PALAZZO_LEGACY_SESSION_MODE=false
+    // to try sessionless without a rebuild once client 405-on-GET handling is confirmed.
+    let legacy_session_mode = std::env::var("PALAZZO_LEGACY_SESSION_MODE")
+        .map(|v| !matches!(v.trim(), "false" | "0" | "off"))
+        .unwrap_or(true);
     let mut http_config = StreamableHttpServerConfig::default()
         .with_cancellation_token(ct_child)
-        .with_accept_unknown_sessions(true);
+        .with_legacy_session_mode(legacy_session_mode);
     match std::env::var("PALAZZO_ALLOWED_HOSTS") {
         Ok(raw) if raw.trim() == "*" => {
             tracing::warn!(
@@ -709,27 +767,28 @@ async fn run_http(rest: &[String]) -> Result<()> {
     // regardless of how many concurrent sessions are open. Per-session Palace
     // instances each hold a clone of this same Arc — no additional model loads.
     let shared_embedder = make_embedder(&cfg)?;
-    let ingest_palace =
-        std::sync::Arc::new(cfg.make_palace_with_embedder(shared_embedder.clone())?);
-    // Clone for the /v1/embeddings route before the original is moved into the
-    // MCP factory closure. Embedder::Clone shares the inner model Arc — still one
-    // TextEmbedding in memory.
+    // Build ONE Palace and share it everywhere. Every field (embedder/qdrant/wal/
+    // tracker) is Arc-backed, so `Palace: Clone` is a cheap Arc-bump and all clones
+    // share the same Qdrant client, WAL, tracker and embedder. This is load-bearing
+    // under rmcp 3.x's stateless streamable-HTTP transport: the service factory runs
+    // per REQUEST, so building a Palace per call would spin up a fresh reqwest/Qdrant
+    // client on every tool call. Build once, clone in.
+    let palace = cfg.make_palace_with_embedder(shared_embedder.clone())?;
+    let ingest_palace = std::sync::Arc::new(palace.clone());
+    // Clone for the /v1/embeddings route. Embedder::Clone shares the inner model Arc.
     let embed_for_v1 = shared_embedder.clone();
     let cfg = std::sync::Arc::new(cfg);
-    let mcp_cfg = cfg.clone();
-    let mcp_embedder = shared_embedder;
-    // Disable the session activity timeout. rmcp's default is 5 min — agents
-    // idle longer than that between tool calls get 404 Session not found.
-    // Zombie sessions from crashed clients are cheap (one idle tokio task + a
-    // HashMap entry) and cleared on the next server restart / deployment.
+    // The factory returns a fresh Palace handle per request — a cheap clone of the
+    // shared one. No idle-session TTL: rmcp's default keep_alive is 300s, after which
+    // an idle session is evicted and the client's next call 404s (agents idle between
+    // tool calls — the "lose MCP mid-insertion" annoyance). With keep_alive=None a
+    // session ends only when the process restarts, so the sole 404 window is a
+    // redeploy/crash. Zombie sessions from crashed clients are cheap (one HashMap
+    // entry) and cleared on the next restart. (No-op when legacy_session_mode=false.)
     let mut session_mgr = LocalSessionManager::default();
     session_mgr.session_config.keep_alive = None;
     let service = StreamableHttpService::new(
-        move || {
-            mcp_cfg
-                .make_palace_with_embedder(mcp_embedder.clone())
-                .map_err(std::io::Error::other)
-        },
+        move || Ok(palace.clone()),
         std::sync::Arc::new(session_mgr),
         http_config,
     );
@@ -771,6 +830,18 @@ async fn run_http(rest: &[String]) -> Result<()> {
     let mut ingest_route = axum::Router::new()
         .route("/ingest", axum::routing::post(ingest_handler))
         .layer(axum::extract::DefaultBodyLimit::max(max_ingest))
+        .with_state(ingest_palace.clone());
+    // GET /find — HTTP sibling of palace_find (semantic search). Shares the same
+    // Palace (embedder + Qdrant) as /ingest. Gated by require_auth when
+    // PALAZZO_AUTH=email (like /ingest and /mcp), open when auth is off.
+    let mut find_route = axum::Router::new()
+        .route("/find", axum::routing::get(find_handler))
+        .with_state(ingest_palace.clone());
+    // GET /stats — JSON palace stats (palace_status over HTTP): collection, total,
+    // facet counts by wing/hall/category, + version & embedder. Shares the Palace;
+    // gated like /find (auth when PALAZZO_AUTH=email, open otherwise).
+    let mut stats_route = axum::Router::new()
+        .route("/stats", axum::routing::get(stats_handler))
         .with_state(ingest_palace);
     let health_route = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
@@ -797,10 +868,10 @@ async fn run_http(rest: &[String]) -> Result<()> {
         )
         .with_state(embed_for_v1);
 
-    // MCP and ingest are the write surfaces — gate them with the bearer
-    // middleware when attribution is enabled. /whoami (token mint), /health,
-    // /metrics, /export, and /v1/* stay open. When auth is off, no middleware
-    // is added and /whoami isn't mounted (behaviour unchanged).
+    // MCP, ingest, find, and stats are gated with the bearer middleware when
+    // attribution is enabled. /whoami (token mint), /health, /metrics, /export,
+    // and /v1/* stay open. When auth is off, no middleware is added and /whoami
+    // isn't mounted (behaviour unchanged).
     let limiter = crate::ratelimit::RateLimiter::new(60, 60);
     let mut mcp_route = axum::Router::new().nest_service("/mcp", service);
     let whoami_route = if auth.enabled() {
@@ -809,6 +880,14 @@ async fn run_http(rest: &[String]) -> Result<()> {
             crate::auth::require_auth,
         ));
         ingest_route = ingest_route.layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_auth,
+        ));
+        find_route = find_route.layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_auth,
+        ));
+        stats_route = stats_route.layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             crate::auth::require_auth,
         ));
@@ -858,6 +937,8 @@ async fn run_http(rest: &[String]) -> Result<()> {
     let router = axum::Router::new()
         .merge(mcp_route)
         .merge(ingest_route)
+        .merge(find_route)
+        .merge(stats_route)
         .merge(health_route)
         .merge(export_route)
         .merge(metrics_route)
@@ -868,7 +949,7 @@ async fn run_http(rest: &[String]) -> Result<()> {
         .await
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!(
-        "listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /export (NDJSON stream), POST /v1/embeddings + GET /v1/models (OpenAI-compatible){}",
+        "listening on {bind}: POST /mcp (MCP), POST /ingest (NDJSON bulk), GET /find (semantic search), GET /stats (JSON stats), GET /export (NDJSON stream), POST /v1/embeddings + GET /v1/models (OpenAI-compatible){}",
         if auth.enabled() {
             ", GET/POST /whoami (token mint)"
         } else {

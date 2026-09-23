@@ -11,7 +11,7 @@ pub struct Qdrant {
     collection: String,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct FindFilter {
     pub wing: Option<String>,
     pub category: Option<String>,
@@ -19,14 +19,35 @@ pub struct FindFilter {
     pub hall: Option<String>,
     /// Exact-match author (the email stamped at write time). Stored lowercased.
     pub author: Option<String>,
-    /// Inclusive lower bound on `timestamp` (RFC3339).
+    /// Inclusive lower bound on `time_field` (RFC3339).
     pub since: Option<String>,
-    /// Inclusive upper bound on `timestamp` (RFC3339).
+    /// Inclusive upper bound on `time_field` (RFC3339).
     pub until: Option<String>,
     /// Hide points whose `valid_until` is at-or-before this instant (RFC3339).
     /// Typically set to "now" by callers that want only current-truth memories.
     /// Points without `valid_until` are always kept.
     pub exclude_superseded_before: Option<String>,
+    /// Which payload key `since`/`until` range against — `"timestamp"` (write
+    /// time, the default) or `"event_time"` (original event time). Qdrant range
+    /// conditions only match points that have the key, so `"event_time"` +
+    /// since/until naturally excludes points with no `event_time` set.
+    pub time_field: String,
+}
+
+impl Default for FindFilter {
+    fn default() -> Self {
+        Self {
+            wing: None,
+            category: None,
+            room: None,
+            hall: None,
+            author: None,
+            since: None,
+            until: None,
+            exclude_superseded_before: None,
+            time_field: "timestamp".to_string(),
+        }
+    }
 }
 
 impl FindFilter {
@@ -67,7 +88,7 @@ impl FindFilter {
             if let Some(u) = &self.until {
                 range.insert("lte".into(), json!(u));
             }
-            must.push(json!({ "key": "timestamp", "range": range }));
+            must.push(json!({ "key": self.time_field, "range": range }));
         }
         if let Some(now) = &self.exclude_superseded_before {
             // Exclude points that have a `valid_until` at-or-before `now`.
@@ -460,7 +481,7 @@ impl Qdrant {
         // COLLECTION name works with no manual Qdrant step.
         self.ensure_collection().await?;
         let url = self.url("/index?wait=true");
-        let fields: [(&str, &str); 7] = [
+        let fields: [(&str, &str); 8] = [
             ("wing", "keyword"),
             ("category", "keyword"),
             ("room", "keyword"),
@@ -468,6 +489,7 @@ impl Qdrant {
             ("author", "keyword"),
             ("timestamp", "datetime"),
             ("valid_until", "datetime"),
+            ("event_time", "datetime"),
         ];
         for (field, schema) in fields {
             let body = json!({ "field_name": field, "field_schema": schema });
@@ -510,6 +532,7 @@ fn hydrate(id: u64, score: Option<f32>, pl: Payload) -> Memory {
         room: pl.room,
         hall: pl.hall,
         timestamp: pl.timestamp,
+        event_time: pl.event_time,
         session: pl.session,
         source_file: pl.source_file,
         author: pl.author,
@@ -532,6 +555,7 @@ fn to_export_point(p: ScrolledPoint) -> Option<ExportPoint> {
         room: pl.room,
         hall: pl.hall,
         timestamp: pl.timestamp,
+        event_time: pl.event_time,
         session: pl.session,
         source_file: pl.source_file,
         author: pl.author,
@@ -596,6 +620,22 @@ mod tests {
         let must = q["must"].as_array().unwrap();
         assert_eq!(must.len(), 1);
         assert_eq!(must[0]["key"], "timestamp");
+        assert_eq!(must[0]["range"]["gte"], "2026-01-01T00:00:00Z");
+        assert_eq!(must[0]["range"]["lte"], "2026-02-01T00:00:00Z");
+    }
+
+    #[test]
+    fn since_until_use_selected_time_field() {
+        let f = FindFilter {
+            since: Some("2026-01-01T00:00:00Z".into()),
+            until: Some("2026-02-01T00:00:00Z".into()),
+            time_field: "event_time".into(),
+            ..FindFilter::default()
+        };
+        let q = f.to_qdrant_filter().unwrap();
+        let must = q["must"].as_array().unwrap();
+        assert_eq!(must.len(), 1);
+        assert_eq!(must[0]["key"], "event_time");
         assert_eq!(must[0]["range"]["gte"], "2026-01-01T00:00:00Z");
         assert_eq!(must[0]["range"]["lte"], "2026-02-01T00:00:00Z");
     }

@@ -78,6 +78,13 @@ pub struct StoreArgs {
     /// Optional source path if the memory was imported from a markdown file.
     #[serde(default)]
     pub source_file: Option<String>,
+    /// Optional RFC3339 second-precision UTC timestamp for when the underlying
+    /// event actually happened — e.g. an email's Date header — as distinct from
+    /// `timestamp` (always stamped at write time and never repurposed). Omit
+    /// when there's no meaningful original time; it is simply left unset on the
+    /// stored point, never backfilled.
+    #[serde(default)]
+    pub event_time: Option<String>,
 }
 
 /// One element of a `palace_store_batch` request. Same fields as `StoreArgs`
@@ -97,6 +104,10 @@ pub struct StoreBatchItem {
     pub session: Option<String>,
     #[serde(default)]
     pub source_file: Option<String>,
+    /// Optional RFC3339 second-precision UTC timestamp for when the underlying
+    /// event actually happened — see `palace_store`'s `event_time` for details.
+    #[serde(default)]
+    pub event_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -151,13 +162,22 @@ pub struct FindArgs {
     /// case-insensitively (authors are stored lowercased).
     #[serde(default)]
     pub author: Option<String>,
-    /// Inclusive lower bound on memory timestamp (RFC3339 second-precision, e.g.
+    /// Inclusive lower bound on `time_field` (RFC3339 second-precision, e.g.
     /// "2026-04-01T00:00:00Z"). Memories older than this are excluded.
     #[serde(default)]
     pub since: Option<String>,
-    /// Inclusive upper bound on memory timestamp (RFC3339 second-precision).
+    /// Inclusive upper bound on `time_field` (RFC3339 second-precision).
     #[serde(default)]
     pub until: Option<String>,
+    /// Which timestamp field `since`/`until` and `recency_half_life_days`
+    /// operate on: "timestamp" (default — when the memory was written) or
+    /// "event_time" (when the underlying event actually happened, e.g. an
+    /// email's Date header). Omit for today's default behavior. Points with no
+    /// `event_time` are naturally excluded by an `event_time` since/until range,
+    /// and get no recency boost under `time_field="event_time"`. Any other
+    /// value is rejected.
+    #[serde(default)]
+    pub time_field: Option<String>,
     /// Optional recency boost: after top-N cosine retrieval, re-rank by
     /// `score * exp(-age_days / half_life)`. Set to a positive number of days to
     /// enable (e.g. 365 = year-long half-life). Omit or 0 for pure cosine.
@@ -304,7 +324,7 @@ impl Palace {
                 metrics::counter!("palazzo_tool_calls_total", "tool" => tool, "status" => "ok")
                     .increment(1);
                 metrics::histogram!("palazzo_tool_duration_seconds", "tool" => tool).record(secs);
-                Ok(CallToolResult::success(vec![Content::text(body)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -486,6 +506,7 @@ impl Palace {
         let wing = validate_tag("wing", &args.wing)?;
         let room = validate_tag("room", &args.room)?;
         let hall = validate_tag("hall", &args.hall)?;
+        validate_event_time(&args.event_time)?;
         let vec = self.embedder.embed(&args.text).await?;
 
         // Duplicate check — scan the top-K (not just top-1): a *different*
@@ -518,6 +539,7 @@ impl Palace {
             hall,
             text: args.text.clone(),
             timestamp: timestamp.clone(),
+            event_time: args.event_time.clone(),
             session: args.session.clone(),
             source_file: args.source_file.clone(),
             author,
@@ -687,6 +709,7 @@ impl Palace {
                 hall: item.hall.trim().to_string(),
                 text: item.text.clone(),
                 timestamp: now.clone(),
+                event_time: item.event_time.clone(),
                 session: item.session.clone(),
                 source_file: item.source_file.clone(),
                 author: author.clone(),
@@ -814,7 +837,7 @@ impl Palace {
         BatchStoreResult { items, counts }
     }
 
-    async fn do_find(&self, args: FindArgs) -> anyhow::Result<Vec<Memory>> {
+    pub(crate) async fn do_find(&self, args: FindArgs) -> anyhow::Result<Vec<Memory>> {
         if args.query.len() > MAX_TEXT_BYTES {
             anyhow::bail!(
                 "query too large: {} bytes (max {})",
@@ -831,6 +854,16 @@ impl Palace {
                 );
             }
         }
+        // time_field selects which payload field since/until range against and
+        // which field the recency re-rank reads. Default (None / "timestamp")
+        // reproduces the pre-event_time behavior exactly.
+        let time_field = match args.time_field.as_deref() {
+            None | Some("timestamp") => "timestamp",
+            Some("event_time") => "event_time",
+            Some(other) => anyhow::bail!(
+                "time_field must be \"timestamp\" or \"event_time\", got {other:?}"
+            ),
+        };
         let limit = args.limit.unwrap_or(5).clamp(1, 20);
         let exclude_superseded_before = if args.include_superseded.unwrap_or(false) {
             None
@@ -848,6 +881,7 @@ impl Palace {
             since: args.since,
             until: args.until,
             exclude_superseded_before,
+            time_field: time_field.to_string(),
         };
         let vec = self.embedder.embed(&args.query).await?;
 
@@ -865,7 +899,19 @@ impl Palace {
                 .unwrap_or(0);
             let half_life_secs = hl * 86_400.0;
             for m in &mut hits {
-                let ts = crate::util::parse_rfc3339(&m.timestamp).unwrap_or(now_secs);
+                // Pick the field the recency rerank should read. Under the
+                // default "timestamp" this is always present (unchanged
+                // behavior); under "event_time" a point with none set gets no
+                // recency boost — its raw cosine score is left untouched.
+                let ts_str: Option<&str> = if time_field == "event_time" {
+                    m.event_time.as_deref()
+                } else {
+                    Some(m.timestamp.as_str())
+                };
+                let Some(ts_str) = ts_str else {
+                    continue;
+                };
+                let ts = crate::util::parse_rfc3339(ts_str).unwrap_or(now_secs);
                 let age = (now_secs - ts).max(0) as f64;
                 let decay = (-age / half_life_secs).exp() as f32;
                 if let Some(s) = m.score.as_mut() {
@@ -929,6 +975,9 @@ impl Palace {
             hall: hall.clone(),
             text: args.text.clone(),
             timestamp: now.clone(),
+            // `palace_supersede` doesn't take an `event_time` arg — the
+            // replacement memory has no original event time of its own.
+            event_time: None,
             session: args.session.clone(),
             source_file: args.source_file.clone(),
             author,
@@ -1152,6 +1201,7 @@ impl Palace {
             } else {
                 Some(now_rfc3339())
             },
+            ..FindFilter::default()
         };
 
         // Enumerate matches via scroll, capped at MAX_FILTER_DELETE + 1
@@ -1281,7 +1331,7 @@ impl Palace {
         self.qdrant.retrieve(args.ids).await
     }
 
-    async fn do_status(&self) -> anyhow::Result<serde_json::Value> {
+    pub(crate) async fn do_status(&self) -> anyhow::Result<serde_json::Value> {
         let total = self.qdrant.count(&FindFilter::default()).await?;
         let wings = self.qdrant.facet("wing").await?;
         let halls = self.qdrant.facet("hall").await?;
@@ -1437,7 +1487,7 @@ impl ServerHandler for Palace {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_server_info(Implementation::from_build_env())
-        .with_protocol_version(ProtocolVersion::LATEST)
+        .with_protocol_version(ProtocolVersion::V_2025_11_25)
         .with_instructions(
             "palazzo — Cali's memory palace over MCP. \
              Every memory is filed under four free-text labels — category, wing, room, hall — \
@@ -1569,13 +1619,29 @@ fn validate_tag(field: &str, value: &str) -> anyhow::Result<String> {
     Ok(trimmed.to_string())
 }
 
-/// Validate all four taxonomy tags of a batch item up-front, so a doomed item
-/// fails before the batch reaches the embedder.
+/// Validate all four taxonomy tags of a batch item, plus its optional
+/// `event_time`, up-front so a doomed item fails before the batch reaches
+/// the embedder.
 fn validate_item_tags(item: &StoreBatchItem) -> anyhow::Result<()> {
     validate_tag("category", &item.category)?;
     validate_tag("wing", &item.wing)?;
     validate_tag("room", &item.room)?;
     validate_tag("hall", &item.hall)?;
+    validate_event_time(&item.event_time)?;
+    Ok(())
+}
+
+/// Validate an optional `event_time` — RFC3339 second-precision UTC, same
+/// shape and error style as `since`/`until`. `None` is always valid; there is
+/// no backfill, so a caller with no meaningful original time just omits it.
+fn validate_event_time(event_time: &Option<String>) -> anyhow::Result<()> {
+    if let Some(et) = event_time
+        && crate::util::parse_rfc3339(et).is_none()
+    {
+        anyhow::bail!(
+            "event_time must be RFC3339 second-precision UTC (e.g. 2026-04-20T00:00:00Z), got {et:?}"
+        );
+    }
     Ok(())
 }
 
@@ -1660,6 +1726,7 @@ mod tests {
             hall: "facts".into(),
             session: None,
             source_file: None,
+            event_time: None,
         }
     }
 
@@ -1674,6 +1741,7 @@ mod tests {
             author: None,
             since: None,
             until: None,
+            time_field: None,
             recency_half_life_days: None,
             include_superseded: None,
         }
@@ -2077,6 +2145,41 @@ mod tests {
         assert!(err.to_string().contains("RFC3339"), "{err:#}");
     }
 
+    #[tokio::test]
+    async fn store_rejects_bad_event_time() {
+        let p = test_palace("http://127.0.0.1:9", None);
+        let err = p
+            .do_store(
+                StoreArgs {
+                    event_time: Some("not a date".into()),
+                    ..store_args("text")
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("event_time"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn store_accepts_missing_event_time() {
+        // None is always valid — no backfill, no error.
+        assert!(validate_event_time(&None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn find_rejects_bad_time_field() {
+        let p = test_palace("http://127.0.0.1:9", None);
+        let err = p
+            .do_find(FindArgs {
+                time_field: Some("bogus".into()),
+                ..find_args("query")
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("time_field"), "{err:#}");
+    }
+
     // ---------- store / dedup / find — need real (fake) embeddings ----------
 
     #[cfg(feature = "fastembed")]
@@ -2092,6 +2195,7 @@ mod tests {
                 hall: "facts".into(),
                 session: None,
                 source_file: None,
+                event_time: None,
             }
         }
 
@@ -2259,6 +2363,66 @@ mod tests {
             // With a half-life the fetch over-samples (limit*4, capped at 80).
             let searches = mock.requests_for("POST /points/search");
             assert_eq!(searches[0]["limit"], 20);
+        }
+
+        #[tokio::test]
+        async fn find_event_time_reranks_by_event_time_and_skips_unset() {
+            let mock = MockQdrant::start().await;
+            // Point 1 has a recent `timestamp` but an old `event_time` — under
+            // time_field="event_time" it should decay, not stay fresh.
+            let mut old_event = payload_json("old event, fresh write");
+            old_event["timestamp"] = json!(now_rfc3339());
+            old_event["event_time"] = json!("2020-01-01T00:00:00Z");
+            // Point 2 has no event_time at all — must get NO recency boost
+            // (its raw cosine score is left untouched).
+            let no_event = payload_json("no event_time set");
+            mock.push(
+                "POST /points/search",
+                json!({"result": [
+                    {"id": 1, "score": 0.9, "payload": old_event},
+                    {"id": 2, "score": 0.5, "payload": no_event},
+                ]}),
+            );
+            let p = test_palace(&mock.url, None);
+
+            let hits = p
+                .do_find(FindArgs {
+                    time_field: Some("event_time".into()),
+                    recency_half_life_days: Some(30.0),
+                    ..find_args("query")
+                })
+                .await
+                .unwrap();
+
+            // Point 1's old event_time decays its score well below its raw 0.9;
+            // point 2's score is untouched at 0.5 — so it now outranks point 1.
+            assert_eq!(hits[0].id, 2, "unset event_time keeps raw score, wins");
+            assert_eq!(hits[0].score, Some(0.5));
+            assert!(
+                hits[1].score.unwrap() < 0.5,
+                "old event_time should decay below the untouched score"
+            );
+
+            let searches = mock.requests_for("POST /points/search");
+            assert_eq!(searches[0]["limit"], 20);
+        }
+
+        #[tokio::test]
+        async fn find_event_time_range_uses_event_time_key() {
+            let mock = MockQdrant::start().await;
+            mock.push("POST /points/search", json!({"result": []}));
+            let p = test_palace(&mock.url, None);
+
+            p.do_find(FindArgs {
+                since: Some("2026-01-01T00:00:00Z".into()),
+                time_field: Some("event_time".into()),
+                ..find_args("query")
+            })
+            .await
+            .unwrap();
+
+            let searches = mock.requests_for("POST /points/search");
+            assert_eq!(searches[0]["filter"]["must"][0]["key"], "event_time");
         }
 
         #[tokio::test]
