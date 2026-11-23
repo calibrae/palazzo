@@ -40,6 +40,12 @@ const MAX_FILTER_DELETE: usize = 1000;
 /// is ~8 MB request payload — well under any sensible HTTP limit and tractable for the
 /// embedder in one batch. Bigger bulk loads should issue multiple calls.
 pub const MAX_STORE_BATCH: usize = 256;
+/// Tools served only when the image palace is attached (PALAZZO_VISION=1).
+const IMAGE_TOOLS: [&str; 3] = [
+    "palace_store_image",
+    "palace_find_images",
+    "palace_delete_images",
+];
 /// Max byte length of a free-text taxonomy tag (category / wing / room / hall).
 /// Generous — these are short labels, not prose; 64 bytes stops accidental
 /// essays-as-tags without constraining real use.
@@ -51,9 +57,12 @@ pub struct Palace {
     qdrant: Arc<Qdrant>,
     wal: Arc<Wal>,
     tracker: Arc<Tracker>,
-    // `tool_router` is read via the derived `Clone` impl and by the `#[tool_router]` macro,
-    // but clippy can't see that — silence the warning.
-    #[allow(dead_code)]
+    /// Image memories (separate collection). `None` unless PALAZZO_VISION is on;
+    /// the image tools are then removed from the router, not just refused.
+    #[cfg(feature = "fastembed")]
+    images: Option<crate::images::ImagePalace>,
+    /// Served by `#[tool_handler(router = self.tool_router)]`; image tools are
+    /// removed from it unless the image palace is attached.
     tool_router: ToolRouter<Palace>,
 }
 
@@ -295,13 +304,48 @@ pub struct GainArgs {
 #[tool_router]
 impl Palace {
     pub fn new(embedder: Embedder, qdrant: Qdrant, wal: Wal, tracker: Tracker) -> Self {
+        let mut tool_router = Self::tool_router();
+        for name in IMAGE_TOOLS {
+            tool_router.remove_route(name);
+        }
         Self {
             embedder: Arc::new(embedder),
             qdrant: Arc::new(qdrant),
             wal: Arc::new(wal),
             tracker: Arc::new(tracker),
-            tool_router: Self::tool_router(),
+            #[cfg(feature = "fastembed")]
+            images: None,
+            tool_router,
         }
+    }
+
+    /// Attach the image palace and expose the image tools.
+    #[cfg(feature = "fastembed")]
+    pub fn with_images(mut self, images: crate::images::ImagePalace) -> Self {
+        self.images = Some(images);
+        self.tool_router = Self::tool_router();
+        self
+    }
+
+    #[cfg(feature = "fastembed")]
+    pub fn images(&self) -> Option<&crate::images::ImagePalace> {
+        self.images.as_ref()
+    }
+
+    /// Shared handles for building the image palace next to this one.
+    pub fn embedder_arc(&self) -> Arc<Embedder> {
+        self.embedder.clone()
+    }
+
+    pub fn wal_arc(&self) -> Arc<Wal> {
+        self.wal.clone()
+    }
+
+    #[cfg(feature = "fastembed")]
+    fn image_palace(&self) -> anyhow::Result<&crate::images::ImagePalace> {
+        self.images
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("image memories are disabled (set PALAZZO_VISION=1)"))
     }
 
     /// Bridge between an `anyhow::Result<T>` body and an MCP `CallToolResult`,
@@ -455,6 +499,70 @@ impl Palace {
     }
 
     #[tool(
+        description = "File an IMAGE memory (only when PALAZZO_VISION=1). Embeds the image with nomic-embed-vision-v1.5 into a SEPARATE image collection, with the usual wing/room/hall/category plus a required `source` (URL/path/reference — palazzo stores the vector and metadata, never the bytes) and an optional caption/event_time. Exact same image bytes (SHA-256) return the existing ID. Base64 in tool args is expensive in context: for anything bigger than a small screenshot, POST NDJSON to the sibling /images endpoint with curl instead."
+    )]
+    async fn palace_store_image(
+        &self,
+        Parameters(args): Parameters<crate::image_args::StoreImageArgs>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        #[cfg(feature = "fastembed")]
+        let res = match self.image_palace() {
+            Ok(ip) => ip.store(args, author_from(&extensions)).await,
+            Err(e) => Err(e),
+        };
+        #[cfg(not(feature = "fastembed"))]
+        let res: anyhow::Result<()> = {
+            let _ = (args, extensions);
+            Err(anyhow::anyhow!("image memories need the fastembed build"))
+        };
+        self.finish_tool("palace_store_image", started, res)
+    }
+
+    #[tool(
+        description = "Search IMAGE memories with a text description (only when PALAZZO_VISION=1). Ranks only against the separate image collection — text memories are never mixed in, use palace_find for those. Scores are small in absolute terms (~0.03-0.10 is a real match); compare them only with each other. English queries match better than French. Filters: wing/category/room/hall/author, since/until with time_field timestamp|event_time. Returns id, score, source, caption, tags, format, size."
+    )]
+    async fn palace_find_images(
+        &self,
+        Parameters(args): Parameters<crate::image_args::FindImagesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        #[cfg(feature = "fastembed")]
+        let res = match self.image_palace() {
+            Ok(ip) => ip.find(args).await,
+            Err(e) => Err(e),
+        };
+        #[cfg(not(feature = "fastembed"))]
+        let res: anyhow::Result<()> = {
+            let _ = args;
+            Err(anyhow::anyhow!("image memories need the fastembed build"))
+        };
+        self.finish_tool("palace_find_images", started, res)
+    }
+
+    #[tool(
+        description = "DESTRUCTIVE — hard-deletes IMAGE memories by ID from the image collection. **You MUST get the human operator's explicit approval before EVERY call.** `confirm` must be true and `reason` must name the approval and why. Each point's full metadata is WAL-logged before deletion; vectors are not recoverable. Missing IDs are reported, not errors. Cap 100 IDs/call."
+    )]
+    async fn palace_delete_images(
+        &self,
+        Parameters(args): Parameters<crate::image_args::DeleteImagesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        #[cfg(feature = "fastembed")]
+        let res = match self.image_palace() {
+            Ok(ip) => ip.delete(args).await,
+            Err(e) => Err(e),
+        };
+        #[cfg(not(feature = "fastembed"))]
+        let res: anyhow::Result<()> = {
+            let _ = args;
+            Err(anyhow::anyhow!("image memories need the fastembed build"))
+        };
+        self.finish_tool("palace_delete_images", started, res)
+    }
+
+    #[tool(
         description = "Token-savings report: how many tokens of agent context this palazzo has saved versus a hand-coded SSH+curl+jq equivalent. Aggregates the per-tool gain log; pass `since` (RFC3339) to scope to a recent window. Set include_text=true for a human-friendly text block alongside the structured numbers."
     )]
     async fn palace_gain(
@@ -548,6 +656,8 @@ impl Palace {
             supersedes: None,
             superseded_by: None,
             superseded_reason: None,
+            external_id: None,
+            meta: None,
         };
 
         self.wal.log(
@@ -718,6 +828,8 @@ impl Palace {
                 supersedes: None,
                 superseded_by: None,
                 superseded_reason: None,
+                external_id: None,
+                meta: None,
             };
             self.wal.log(
                 "palace_store_batch:item",
@@ -986,6 +1098,8 @@ impl Palace {
             supersedes: Some(args.supersedes.clone()),
             superseded_by: None,
             superseded_reason: None,
+            external_id: None,
+            meta: None,
         };
 
         self.wal.log(
@@ -1480,10 +1594,13 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-#[tool_handler]
+// `router = self.tool_router`: the macro's default is `Self::tool_router()`, a
+// fresh FULL router per call, which would ignore the image tools that `new()`
+// removes when PALAZZO_VISION is off.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for Palace {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_server_info(Implementation::from_build_env())
@@ -1499,6 +1616,7 @@ impl ServerHandler for Palace {
              (Content-Type: application/x-ndjson, body = JSONL of palace_store items). Invoke via Bash(curl --data-binary @file) — the bytes flow through curl's body and never enter the MCP transcript, \
              unlike palace_store_batch tool args which do. Same backend (embed, dedup, WAL, upsert), zero context cost for the payload. \
              For exporting the palace (backups, migration, filtered slices), the sibling GET /export streams the collection as NDJSON — one point per line, optional 768-dim vector and the same filter knobs as palace_find (wing/category/room/hall/since/until/include_superseded). Curl the URL straight to a file; bytes never enter the MCP transcript. \
+             When image memories are enabled (PALAZZO_VISION=1), palace_store_image / palace_find_images / palace_delete_images manage a SEPARATE image collection searched by text description; bulk image uploads go through POST /images (NDJSON, max 16 per request) with curl, not tool args. \
              Error handling: if any tool call returns 'Session not found', the MCP session was reset (server restarted). \
              Retry the exact same call once — the client will re-establish the session automatically and the retry will succeed.".to_string(),
         )
@@ -1521,7 +1639,7 @@ fn author_from(ext: &rmcp::model::Extensions) -> Option<String> {
         .map(|a| a.0.clone())
 }
 
-fn new_id() -> u64 {
+pub(crate) fn new_id() -> u64 {
     use std::sync::atomic::Ordering;
     // Unix millis, guaranteed above the 1_000_000_000 floor.
     let millis = SystemTime::now()
@@ -1605,7 +1723,7 @@ fn facet_map(items: &[(String, u64)]) -> serde_json::Value {
 /// surrounding whitespace, rejects empty / whitespace-only values and tags over
 /// `MAX_TAG_BYTES`. Returns the trimmed string to store, so " facts " and
 /// "facts" never silently split into two distinct tags.
-fn validate_tag(field: &str, value: &str) -> anyhow::Result<String> {
+pub(crate) fn validate_tag(field: &str, value: &str) -> anyhow::Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         anyhow::bail!("{field} is empty");
@@ -1748,6 +1866,28 @@ mod tests {
     }
 
     // ---------- pure helpers ----------
+
+    #[test]
+    fn image_tools_only_when_images_attached() {
+        let p = test_palace("http://127.0.0.1:9", None);
+        for name in IMAGE_TOOLS {
+            assert!(!p.tool_router.has_route(name), "{name} must be hidden");
+        }
+        assert!(p.tool_router.has_route("palace_find"));
+        #[cfg(feature = "fastembed")]
+        {
+            let ip = crate::images::ImagePalace::new(
+                crate::vision::VisionEmbedder::new(),
+                p.embedder_arc(),
+                Qdrant::new("http://127.0.0.1:9", "test-images"),
+                p.wal_arc(),
+            );
+            let p = p.with_images(ip);
+            for name in IMAGE_TOOLS {
+                assert!(p.tool_router.has_route(name), "{name} must be served");
+            }
+        }
+    }
 
     #[test]
     fn new_id_strictly_increases() {
@@ -2203,7 +2343,7 @@ mod tests {
         async fn store_duplicate_short_circuits_and_excludes_superseded() {
             let mock = MockQdrant::start().await;
             mock.push(
-                "POST /points/search",
+                "POST /points/query",
                 json!({"result": [
                     {"id": 42, "score": 0.99, "payload": payload_json("same text")},
                 ]}),
@@ -2218,7 +2358,7 @@ mod tests {
 
             // The dedup search must hide superseded points (a superseded match
             // would swallow the re-store and leave the memory invisible).
-            let searches = mock.requests_for("POST /points/search");
+            let searches = mock.requests_for("POST /points/query");
             assert_eq!(searches[0]["filter"]["must_not"][0]["key"], "valid_until");
         }
 
@@ -2226,7 +2366,7 @@ mod tests {
         async fn store_high_score_different_text_still_stores() {
             let mock = MockQdrant::start().await;
             mock.push(
-                "POST /points/search",
+                "POST /points/query",
                 json!({"result": [
                     {"id": 42, "score": 0.99, "payload": payload_json("other text")},
                 ]}),
@@ -2246,12 +2386,12 @@ mod tests {
             let mock = MockQdrant::start().await;
             // Dedup searches run in item order over valid items: dup first, fresh second.
             mock.push(
-                "POST /points/search",
+                "POST /points/query",
                 json!({"result": [
                     {"id": 42, "score": 0.99, "payload": payload_json("dup text")},
                 ]}),
             );
-            mock.push("POST /points/search", json!({"result": []}));
+            mock.push("POST /points/query", json!({"result": []}));
             let p = test_palace(&mock.url, None);
 
             let res = p
@@ -2290,7 +2430,7 @@ mod tests {
         async fn check_duplicate_reports_threshold_and_filters_superseded() {
             let mock = MockQdrant::start().await;
             mock.push(
-                "POST /points/search",
+                "POST /points/query",
                 json!({"result": [
                     {"id": 7, "score": 0.97, "payload": payload_json("close")},
                 ]}),
@@ -2306,7 +2446,7 @@ mod tests {
             assert_eq!(res["is_duplicate"], true);
             assert_eq!(res["closest"]["id"], 7);
 
-            let searches = mock.requests_for("POST /points/search");
+            let searches = mock.requests_for("POST /points/query");
             assert_eq!(searches[0]["filter"]["must_not"][0]["key"], "valid_until");
         }
 
@@ -2321,7 +2461,7 @@ mod tests {
             })
             .await
             .unwrap();
-            let searches = mock.requests_for("POST /points/search");
+            let searches = mock.requests_for("POST /points/query");
             assert_eq!(searches[0]["limit"], 20); // clamped
             assert_eq!(searches[0]["filter"]["must_not"][0]["key"], "valid_until");
 
@@ -2331,7 +2471,7 @@ mod tests {
             })
             .await
             .unwrap();
-            let searches = mock.requests_for("POST /points/search");
+            let searches = mock.requests_for("POST /points/query");
             assert!(searches[1].get("filter").is_none());
         }
 
@@ -2343,7 +2483,7 @@ mod tests {
             let mut new = payload_json("recent");
             new["timestamp"] = json!(now_rfc3339());
             mock.push(
-                "POST /points/search",
+                "POST /points/query",
                 json!({"result": [
                     {"id": 1, "score": 0.9, "payload": old},
                     {"id": 2, "score": 0.5, "payload": new},
@@ -2361,7 +2501,7 @@ mod tests {
             assert_eq!(hits[0].id, 2, "recent point should outrank decayed one");
 
             // With a half-life the fetch over-samples (limit*4, capped at 80).
-            let searches = mock.requests_for("POST /points/search");
+            let searches = mock.requests_for("POST /points/query");
             assert_eq!(searches[0]["limit"], 20);
         }
 
@@ -2377,7 +2517,7 @@ mod tests {
             // (its raw cosine score is left untouched).
             let no_event = payload_json("no event_time set");
             mock.push(
-                "POST /points/search",
+                "POST /points/query",
                 json!({"result": [
                     {"id": 1, "score": 0.9, "payload": old_event},
                     {"id": 2, "score": 0.5, "payload": no_event},
@@ -2403,14 +2543,14 @@ mod tests {
                 "old event_time should decay below the untouched score"
             );
 
-            let searches = mock.requests_for("POST /points/search");
+            let searches = mock.requests_for("POST /points/query");
             assert_eq!(searches[0]["limit"], 20);
         }
 
         #[tokio::test]
         async fn find_event_time_range_uses_event_time_key() {
             let mock = MockQdrant::start().await;
-            mock.push("POST /points/search", json!({"result": []}));
+            mock.push("POST /points/query", json!({"result": []}));
             let p = test_palace(&mock.url, None);
 
             p.do_find(FindArgs {
@@ -2421,7 +2561,7 @@ mod tests {
             .await
             .unwrap();
 
-            let searches = mock.requests_for("POST /points/search");
+            let searches = mock.requests_for("POST /points/query");
             assert_eq!(searches[0]["filter"]["must"][0]["key"], "event_time");
         }
 
@@ -2432,7 +2572,7 @@ mod tests {
             // scan all K hits — the exact-text match lives at position 2 (id=20).
             let mock = MockQdrant::start().await;
             mock.push(
-                "POST /points/search",
+                "POST /points/query",
                 json!({"result": [
                     {"id": 10, "score": 0.99, "payload": payload_json("different text")},
                     {"id": 20, "score": 0.96, "payload": payload_json("same text")},
@@ -2458,8 +2598,8 @@ mod tests {
             // intra-batch seen_text map must catch the second one.
             let mock = MockQdrant::start().await;
             // One empty dedup-search response per item.
-            mock.push("POST /points/search", json!({"result": []}));
-            mock.push("POST /points/search", json!({"result": []}));
+            mock.push("POST /points/query", json!({"result": []}));
+            mock.push("POST /points/query", json!({"result": []}));
             let p = test_palace(&mock.url, None);
 
             let res = p

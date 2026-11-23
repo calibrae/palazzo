@@ -9,7 +9,7 @@ re-run; Qdrant upsert with existing IDs just overwrites.
 
 Usage:
     python replay_to_fastembed.py \\
-        --qdrant http://10.10.0.3:6333 \\
+        --qdrant http://127.0.0.1:6333 \\
         --source claude-memory \\
         --target claude-memory-fastembed \\
         [--batch 32] [--dry-run]

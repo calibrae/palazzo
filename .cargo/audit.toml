@@ -1,0 +1,9 @@
+# cargo-audit config. CI sets CARGO_HOME to this directory, and local runs read
+# ./.cargo/audit.toml, so both use the same list.
+[advisories]
+ignore = [
+    # chrono is unmaintained: informational, not a vulnerability. It comes in
+    # through rmcp, schemars and mcp-gain and can't be removed from here.
+    # Drop this entry once those upstreams move off chrono.
+    "RUSTSEC-2026-0543",
+]

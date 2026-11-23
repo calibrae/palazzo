@@ -50,6 +50,14 @@ pub struct Payload {
     /// Human explanation for the supersession. Set on the old point.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_reason: Option<String>,
+    /// Caller-supplied stable key (service `/docs` API). Unique among current
+    /// (not superseded) points of a wing. Absent on ordinary memories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Small caller metadata (string → string), stored and returned verbatim,
+    /// never embedded. Absent on ordinary memories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A point as returned to MCP callers — the structured view of a palace memory.
@@ -84,6 +92,14 @@ pub struct Memory {
     pub superseded_by: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_reason: Option<String>,
+    /// Caller-supplied stable key (service `/docs` API). Unique among current
+    /// (not superseded) points of a wing. Absent on ordinary memories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Small caller metadata (string → string), stored and returned verbatim,
+    /// never embedded. Absent on ordinary memories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A point as returned by the `GET /export` HTTP endpoint — includes the vector.
@@ -116,4 +132,12 @@ pub struct ExportPoint {
     pub superseded_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector: Option<Vec<f32>>,
+    /// Caller-supplied stable key (service `/docs` API). Unique among current
+    /// (not superseded) points of a wing. Absent on ordinary memories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Small caller metadata (string → string), stored and returned verbatim,
+    /// never embedded. Absent on ordinary memories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<std::collections::BTreeMap<String, String>>,
 }

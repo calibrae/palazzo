@@ -37,7 +37,7 @@ pub enum Input {
 }
 
 impl Input {
-    fn into_vec(self) -> Vec<String> {
+    pub(crate) fn into_vec(self) -> Vec<String> {
         match self {
             Input::Single(s) => vec![s],
             Input::Many(v) => v,
@@ -70,6 +70,15 @@ pub struct EmbeddingsResponse {
     pub object: &'static str,
     pub data: Vec<EmbeddingData>,
     pub model: String,
+    /// OpenAI clients expect `usage` on every response (the SDK's response model
+    /// declares it). palazzo doesn't meter tokens, so both counts are 0.
+    pub usage: Usage,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct Usage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
 }
 
 #[derive(Debug)]
@@ -92,10 +101,16 @@ impl EmbedError {
     }
 }
 
-fn prefix_for(input_type: Option<&str>) -> &'static str {
+/// `input_type` wins when given. Otherwise the model name picks the prefix —
+/// stock OpenAI clients (LangChain `OpenAIEmbeddings`, the openai SDK) can't send
+/// extension fields, but they can send `model: "nomic-embed-text-query"`.
+/// Default: document.
+fn prefix_for(input_type: Option<&str>, model: &str) -> &'static str {
     match input_type {
         Some("query") => QUERY_PREFIX,
-        _ => DOC_PREFIX,
+        Some(_) => DOC_PREFIX,
+        None if model.ends_with("-query") => QUERY_PREFIX,
+        None => DOC_PREFIX,
     }
 }
 
@@ -106,7 +121,7 @@ pub async fn do_embeddings(
     req: EmbeddingsRequest,
 ) -> Result<EmbeddingsResponse, EmbedError> {
     let model = req.model.unwrap_or_else(|| "nomic-embed-text".to_string());
-    let prefix = prefix_for(req.input_type.as_deref());
+    let prefix = prefix_for(req.input_type.as_deref(), &model);
     let inputs = req.input.into_vec();
 
     if inputs.is_empty() {
@@ -153,6 +168,7 @@ pub async fn do_embeddings(
         object: "list",
         data,
         model,
+        usage: Usage::default(),
     })
 }
 
@@ -176,20 +192,29 @@ pub async fn embeddings_handler(
     }
 }
 
-/// `GET /v1/models` — OpenAI-compatible model list. palazzo serves one model;
-/// discovery/validation tooling expects a non-empty `data` array here.
-pub async fn models_handler() -> axum::Json<serde_json::Value> {
-    axum::Json(json!({
-        "object": "list",
-        "data": [{
-            "id": "nomic-embed-text",
+/// `GET /v1/models` — OpenAI-compatible model list. Discovery/validation tooling
+/// expects a non-empty `data` array here. The vision model is listed only when
+/// `PALAZZO_VISION` enables `POST /v1/image-embeddings`.
+pub fn models_body(vision: bool) -> serde_json::Value {
+    let mut data: Vec<serde_json::Value> = [
+        "nomic-embed-text",
+        "nomic-embed-text-query",
+        "nomic-embed-text-document",
+    ]
+    .iter()
+    .map(|id| json!({ "id": id, "object": "model", "owned_by": "palazzo" }))
+    .collect();
+    if vision {
+        data.push(json!({
+            "id": "nomic-embed-vision-v1.5",
             "object": "model",
             "owned_by": "palazzo",
-        }],
-    }))
+        }));
+    }
+    json!({ "object": "list", "data": data })
 }
 
-fn error_response(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn error_response(status: StatusCode, msg: &str) -> Response {
     (
         status,
         axum::Json(json!({
@@ -259,6 +284,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none.data[0].embedding, doc.data[0].embedding);
+    }
+
+    #[tokio::test]
+    async fn model_name_selects_prefix_and_input_type_wins() {
+        let e = Embedder::fake();
+        let run = |model: &str, it: Option<&str>| {
+            let mut r = req(Input::Single("x".into()), it);
+            r.model = Some(model.into());
+            let e = e.clone();
+            async move {
+                do_embeddings(&e, r).await.unwrap().data[0]
+                    .embedding
+                    .clone()
+            }
+        };
+        let q = run("nomic-embed-text", Some("query")).await;
+        let d = run("nomic-embed-text", None).await;
+        assert_eq!(run("nomic-embed-text-query", None).await, q);
+        assert_eq!(run("nomic-embed-text-document", None).await, d);
+        // explicit input_type overrides the model-name hint
+        assert_eq!(run("nomic-embed-text-query", Some("document")).await, d);
+    }
+
+    #[tokio::test]
+    async fn response_carries_openai_usage_block() {
+        let e = Embedder::fake();
+        let resp = do_embeddings(&e, req(Input::Single("x".into()), None))
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["usage"]["prompt_tokens"], 0);
+        assert_eq!(v["usage"]["total_tokens"], 0);
     }
 
     #[tokio::test]

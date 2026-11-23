@@ -1,6 +1,6 @@
 [package]
 name = "palazzo"
-version = "0.14.2"
+version = "0.15.0"
 edition = "2024"
 description = "Self-contained Rust MCP memory palace — Qdrant + local fastembed, typed wing/room/hall schema, temporal supersede, token-savings analytics."
 repository = "https://github.com/calibrae/palazzo"
@@ -12,7 +12,7 @@ default = ["fastembed"]
 # no external services, ~1 GB resident with the Q model loaded, ~110 MB one-time
 # model download on first run. This is the production default — every deployed
 # palazzo (mista, nxpvm) runs this backend.
-fastembed = ["dep:fastembed"]
+fastembed = ["dep:fastembed", "dep:image"]
 # Embed via Ollama (HTTP to nomic-embed-text on a remote host). Tiny binary,
 # zero native deps, but you need a reachable Ollama server somewhere. Useful
 # for dev environments where you'd rather not pay the model download / RSS
@@ -32,7 +32,10 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 schemars = "1.1"
-fastembed = { version = "5", optional = true, default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+fastembed = { version = "5", optional = true, default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls", "image-models"] }
+# Header-only checks (format allowlist, pixel cap) before fastembed decodes an
+# untrusted image for /v1/image-embeddings. Same version fastembed pulls in.
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 mcp-gain = { git = "https://github.com/calibrae/mcp-gain", tag = "v0.1.0" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 metrics = "0.24"
@@ -45,6 +48,13 @@ sha2 = "0.10"
 base64 = "0.22"
 # CSPRNG for OAuth authorization codes. Tiny, pure, already deep in the tree.
 getrandom = "0.2"
+# Ed25519 verification of service tokens. Already in the tree via rustls,
+# so no new crates; only the core features.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "alloc"] }
+
+[dev-dependencies]
+# BMP encoder only for the vision format-allowlist test (a non-allowed format).
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 
 [profile.release]
 lto = "thin"

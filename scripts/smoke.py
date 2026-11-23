@@ -23,12 +23,10 @@ BIN = os.path.join(os.path.dirname(__file__), "..", "target", "release", "palazz
 
 def http(method, url, body=None):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={"Content-Type": "application/json"} if data else {},
-    )
+    headers = {"Content-Type": "application/json"} if data else {}
+    if os.environ.get("QDRANT_API_KEY", "").strip():
+        headers["api-key"] = os.environ["QDRANT_API_KEY"].strip()
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return r.status, json.loads(r.read())

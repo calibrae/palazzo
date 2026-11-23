@@ -89,7 +89,7 @@ Mirrors the existing `PALAZZO_ALLOWED_HOSTS` / `PALAZZO_BIND` pattern in `main.r
 |---|---|---|
 | `PALAZZO_AUTH` | `off` | `off` = no auth (homelab). `email` = self-AS + email attribution. |
 | `PALAZZO_AUTH_SIGNING_KEY` | — | Required when `auth=email`. ≥32 random bytes (HS256). Rotating it invalidates all live tokens. |
-| `PALAZZO_ALLOWED_EMAIL_DOMAINS` | _(empty = any)_ | Comma-separated, e.g. `nexpublica.fr`. Login rejects addresses outside the list. |
+| `PALAZZO_ALLOWED_EMAIL_DOMAINS` | _(empty = any)_ | Comma-separated, e.g. `example.com`. Login rejects addresses outside the list. |
 | `PALAZZO_TOKEN_TTL_SECS` | `2592000` (30d) | Access-token lifetime. |
 | `PALAZZO_AUTH_ISSUER` | derived from bind/host | Public base URL palazzo advertises as the AS issuer (must be the HTTPS URL clients reach, e.g. `https://palazzo-nxp.<domain>`). |
 

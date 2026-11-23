@@ -3,7 +3,7 @@
 //! `qdrant.rs` instead of a hand-rolled trait double.
 //!
 //! Responses are keyed by `"METHOD /path-suffix"` where the suffix is the part
-//! after `/collections/{name}` (e.g. `"POST /points/search"`). Each key holds
+//! after `/collections/{name}` (e.g. `"POST /points/query"`). Each key holds
 //! a FIFO queue — push one canned value per expected call. Unmatched calls get
 //! a sensible empty default. A canned object may carry `"__status"` (HTTP
 //! status override) and `"__body"` (response body when using `__status`).
@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 pub struct MockState {
     /// Every request received: (method, full path, parsed JSON body).
     requests: Mutex<Vec<(String, String, Value)>>,
+    /// `api-key` header of every request, in arrival order (None = absent).
+    api_keys: Mutex<Vec<Option<String>>>,
     /// Canned responses, keyed by `"METHOD /suffix"`.
     responses: Mutex<HashMap<String, VecDeque<Value>>>,
 }
@@ -29,7 +31,7 @@ pub struct MockQdrant {
     state: Arc<MockState>,
 }
 
-/// `/collections/{name}/points/search` → `/points/search`. Paths that don't
+/// `/collections/{name}/points/query` → `/points/query`. Paths that don't
 /// have the prefix come back unchanged.
 fn suffix_of(path: &str) -> String {
     let mut parts = path.splitn(4, '/');
@@ -57,7 +59,7 @@ impl MockQdrant {
         }
     }
 
-    /// Queue a canned response for `key` (e.g. `"POST /points/search"`).
+    /// Queue a canned response for `key` (e.g. `"POST /points/query"`).
     pub fn push(&self, key: &str, resp: Value) {
         self.state
             .responses
@@ -66,6 +68,11 @@ impl MockQdrant {
             .entry(key.to_string())
             .or_default()
             .push_back(resp);
+    }
+
+    /// The `api-key` header of every request received, in order.
+    pub fn api_keys(&self) -> Vec<Option<String>> {
+        self.state.api_keys.lock().unwrap().clone()
     }
 
     /// All request bodies received for `key`, in order.
@@ -85,8 +92,15 @@ async fn handler(
     State(state): State<Arc<MockState>>,
     method: Method,
     uri: Uri,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> (StatusCode, axum::Json<Value>) {
+    state.api_keys.lock().unwrap().push(
+        headers
+            .get("api-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+    );
     let path = uri.path().to_string();
     let body_val: Value = if body.is_empty() {
         Value::Null
@@ -115,12 +129,18 @@ async fn handler(
                 .and_then(Value::as_u64)
                 .and_then(|s| StatusCode::from_u16(s as u16).ok())
                 .unwrap_or(StatusCode::OK);
-            let resp_body = v.get("__body").cloned().unwrap_or(v);
+            let mut resp_body = v.get("__body").cloned().unwrap_or(v);
+            // Tests may give Query API hits as a bare array; real Qdrant wraps
+            // them as {"result": {"points": [...]}}.
+            if suffix == "/points/query" && resp_body["result"].is_array() {
+                let hits = resp_body["result"].take();
+                resp_body["result"] = json!({ "points": hits });
+            }
             (status, axum::Json(resp_body))
         }
         None => {
             let default = match suffix.as_str() {
-                "/points/search" => json!({"result": []}),
+                "/points/query" => json!({"result": {"points": []}}),
                 "/points/scroll" => {
                     json!({"result": {"points": [], "next_page_offset": null}})
                 }

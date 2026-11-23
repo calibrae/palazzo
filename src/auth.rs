@@ -443,12 +443,12 @@ mod tests {
 
     #[test]
     fn domain_allowlist() {
-        let c = AuthConfig::test("super-secret-key-of-some-length", &["nexpublica.fr"]);
-        assert!(c.email_allowed("dev@nexpublica.fr"));
-        assert!(c.email_allowed("dev@NexPublica.FR")); // case-insensitive
+        let c = AuthConfig::test("super-secret-key-of-some-length", &["example.com"]);
+        assert!(c.email_allowed("dev@example.com"));
+        assert!(c.email_allowed("dev@Example.COM")); // case-insensitive
         assert!(!c.email_allowed("dev@gmail.com"));
         assert!(!c.email_allowed("not-an-email"));
-        assert!(!c.email_allowed("@nexpublica.fr"));
+        assert!(!c.email_allowed("@example.com"));
     }
 
     #[test]

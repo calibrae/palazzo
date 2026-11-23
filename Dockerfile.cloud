@@ -20,7 +20,12 @@ COPY target/release/palazzo /usr/local/bin/palazzo
 
 ENV FASTEMBED_CACHE_DIR=/out/var/lib/palazzo/fastembed-cache
 
-RUN palazzo warm \
+# Opt-in: also bake nomic-embed-vision-v1.5 (+~370 MB) for POST /v1/image-embeddings.
+# The cluster has no HF egress, so a deployment that sets PALAZZO_VISION=1 needs
+# an image built with --build-arg PALAZZO_VISION=1. Default: text model only.
+ARG PALAZZO_VISION=0
+
+RUN PALAZZO_VISION=${PALAZZO_VISION} palazzo warm \
  && chown -R 1000:1000 /out/var/lib/palazzo
 
 FROM cgr.dev/chainguard/glibc-dynamic:latest

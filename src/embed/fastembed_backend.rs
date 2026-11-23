@@ -119,10 +119,14 @@ impl Embedder {
             last_embed_at: Arc::new(AtomicU64::new(now_secs())),
         };
 
+        // The vision model (PALAZZO_VISION) adds a few hundred MB of resident
+        // weights + arena that recycling the TEXT model can't reclaim, so its
+        // default threshold sits higher. An explicit env value always wins.
+        let default_rss_mb = if crate::vision::enabled() { 2000 } else { 1500 };
         let recycle_rss_mb: u64 = std::env::var("FASTEMBED_RECYCLE_RSS_MB")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1500);
+            .unwrap_or(default_rss_mb);
         let recycle_idle_secs: u64 = std::env::var("FASTEMBED_RECYCLE_IDLE_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -229,6 +233,13 @@ impl Embedder {
         let inner = self.inner.clone();
         let last_embed_at = self.last_embed_at.clone();
         let recycling = Arc::new(AtomicBool::new(false));
+        // RSS measured right after the last recycle. A recycle only frees the
+        // text model's arena; whatever else is resident (the vision model, the
+        // allocator's retained pages) stays. Without this floor, a process whose
+        // baseline sits above the threshold would rebuild the text model on every
+        // idle tick for nothing. Next recycle needs RSS to grow REGROW_MB past it.
+        const REGROW_MB: u64 = 256;
+        let mut floor_mb: u64 = 0;
         tokio::spawn(async move {
             // Light cadence — we're checking RSS, not driving the recycle.
             // 10 s gives a recycle a few-tick window to fire once RSS crosses
@@ -244,7 +255,7 @@ impl Embedder {
                 let Some(rss) = current_rss_mb() else {
                     continue; // non-Linux: recycling silently disabled
                 };
-                if rss < recycle_rss_mb {
+                if rss < recycle_rss_mb || rss < floor_mb + REGROW_MB {
                     continue;
                 }
                 let idle = now_secs().saturating_sub(last_embed_at.load(Ordering::Acquire));
@@ -278,6 +289,7 @@ impl Embedder {
                             *guard = Inner::Real(fresh);
                         }
                         let after = current_rss_mb().unwrap_or(0);
+                        floor_mb = after;
                         metrics::counter!("palazzo_embedder_recycles_total").increment(1);
                         tracing::info!(rss_mb = after, "fastembed embedder recycled");
                     }

@@ -91,13 +91,7 @@ impl FindFilter {
             must.push(json!({ "key": self.time_field, "range": range }));
         }
         if let Some(now) = &self.exclude_superseded_before {
-            // Exclude points that have a `valid_until` at-or-before `now`.
-            // Qdrant range conditions only match when the field exists, so
-            // points without `valid_until` slip through unaffected.
-            must_not.push(json!({
-                "key": "valid_until",
-                "range": { "lte": now }
-            }));
+            must_not.extend(current_truth_must_not(now));
         }
         let mut body = serde_json::Map::new();
         if !must.is_empty() {
@@ -109,6 +103,32 @@ impl FindFilter {
         Some(Value::Object(body))
     }
 }
+
+/// "Current truth" at `now`: hide points whose `valid_until` is at-or-before
+/// `now` (superseded or expired) and points whose `valid_from` is still in the
+/// future. Range conditions only match when the field exists, so points
+/// without these fields are unaffected.
+pub fn current_truth_must_not(now: &str) -> [Value; 2] {
+    [
+        json!({ "key": "valid_until", "range": { "lte": now } }),
+        json!({ "key": "valid_from", "range": { "gt": now } }),
+    ]
+}
+
+/// Payload indexes of the main (text) collection.
+pub const TEXT_INDEXES: [(&str, &str); 10] = [
+    ("wing", "keyword"),
+    ("category", "keyword"),
+    ("room", "keyword"),
+    ("hall", "keyword"),
+    ("author", "keyword"),
+    ("timestamp", "datetime"),
+    ("valid_until", "datetime"),
+    ("valid_from", "datetime"),
+    ("event_time", "datetime"),
+    // Service /docs API key; absent on ordinary memories (index stays tiny).
+    ("external_id", "keyword"),
+];
 
 #[derive(Debug, Serialize)]
 struct UpsertBody {
@@ -155,13 +175,57 @@ struct ResultWrapper<T> {
     result: T,
 }
 
+/// Query API (`POST /points/query`) result envelope: `{"points": [...]}`.
+/// Replaces the legacy `/points/search`, which Qdrant 1.19 drops from its API.
+#[derive(Debug, Deserialize)]
+struct QueryResult<T> {
+    points: Vec<T>,
+}
+
+/// Nearest-neighbour request for the Query API (available since Qdrant 1.10).
+fn query_body(vector: Vec<f32>, limit: u32, filter: &FindFilter) -> Value {
+    let mut body = json!({ "query": vector, "limit": limit, "with_payload": true });
+    if let Some(f) = filter.to_qdrant_filter() {
+        body["filter"] = f;
+    }
+    body
+}
+
+/// `QDRANT_API_KEY` (trimmed; unset or empty = no key, today's behaviour).
+pub fn api_key_from_env() -> Option<String> {
+    std::env::var("QDRANT_API_KEY")
+        .ok()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
 impl Qdrant {
+    /// Client for `collection`, authenticating with `QDRANT_API_KEY` when set.
     pub fn new(base_url: impl Into<String>, collection: impl Into<String>) -> Self {
+        Self::with_api_key(base_url, collection, api_key_from_env())
+    }
+
+    /// Every request through this client carries `api-key: <key>` — one default
+    /// header, so search/upsert/delete/scroll/count/facet and collection/index
+    /// provisioning are all covered. Marked sensitive so it never shows up in
+    /// reqwest debug output.
+    pub fn with_api_key(
+        base_url: impl Into<String>,
+        collection: impl Into<String>,
+        api_key: Option<String>,
+    ) -> Self {
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+        if let Some(key) = api_key {
+            let mut value = reqwest::header::HeaderValue::from_str(&key).expect(
+                "QDRANT_API_KEY contains characters that are not allowed in an HTTP header",
+            );
+            value.set_sensitive(true);
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("api-key", value);
+            builder = builder.default_headers(headers);
+        }
         Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("reqwest client"),
+            client: builder.build().expect("reqwest client"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             collection: collection.into(),
         }
@@ -233,6 +297,56 @@ impl Qdrant {
         Ok(())
     }
 
+    /// Replace the whole payload of point `id` (Qdrant overwrite-payload). The
+    /// vector is untouched, so metadata-only changes need no re-embedding.
+    pub async fn overwrite_payload(&self, id: u64, payload: &Payload) -> Result<()> {
+        let url = self.url("/points/payload?wait=true");
+        let body = json!({ "payload": payload, "points": [id] });
+        let resp = self
+            .client
+            .put(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("qdrant overwrite_payload {id}: {status} {text}"));
+        }
+        Ok(())
+    }
+
+    /// Points matching a raw Qdrant `filter`, with typed payloads (max `limit`).
+    /// For exact-key lookups (service `/docs` API), not for search.
+    pub async fn scroll_filter(&self, filter: Value, limit: usize) -> Result<Vec<(u64, Payload)>> {
+        let url = self.url("/points/scroll");
+        let body = json!({
+            "limit": limit,
+            "with_payload": true,
+            "with_vector": false,
+            "filter": filter,
+        });
+        let resp: ResultWrapper<ScrollResult> = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .context("qdrant scroll status")?
+            .json()
+            .await
+            .context("qdrant scroll decode")?;
+        Ok(resp
+            .result
+            .points
+            .into_iter()
+            .filter_map(|p| Some((id_as_u64(&p.id)?, p.payload?)))
+            .collect())
+    }
+
     /// Hard-delete one or more points by ID. Missing IDs are silently ok.
     pub async fn delete(&self, ids: &[u64]) -> Result<()> {
         if ids.is_empty() {
@@ -265,16 +379,9 @@ impl Qdrant {
         filter: &FindFilter,
     ) -> Result<Vec<Memory>> {
         let t0 = std::time::Instant::now();
-        let url = self.url("/points/search");
-        let mut body = json!({
-            "vector": vector,
-            "limit": limit,
-            "with_payload": true,
-        });
-        if let Some(f) = filter.to_qdrant_filter() {
-            body["filter"] = f;
-        }
-        let resp: ResultWrapper<Vec<ScoredPoint>> = self
+        let url = self.url("/points/query");
+        let body = query_body(vector, limit, filter);
+        let resp: ResultWrapper<QueryResult<ScoredPoint>> = self
             .client
             .post(&url)
             .json(&body)
@@ -290,6 +397,38 @@ impl Qdrant {
             .record(t0.elapsed().as_secs_f64());
         Ok(resp
             .result
+            .points
+            .into_iter()
+            .filter_map(to_memory_scored)
+            .collect())
+    }
+
+    /// Vector search with a raw Qdrant `filter`, typed results. For filters
+    /// `FindFilter` can't express (e.g. the `/docs/search` scope pairs).
+    pub async fn search_filter(
+        &self,
+        vector: Vec<f32>,
+        limit: u32,
+        filter: Value,
+    ) -> Result<Vec<Memory>> {
+        let url = self.url("/points/query");
+        let body =
+            json!({ "query": vector, "limit": limit, "with_payload": true, "filter": filter });
+        let resp: ResultWrapper<QueryResult<ScoredPoint>> = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .context("qdrant search status")?
+            .json()
+            .await
+            .context("qdrant search decode")?;
+        Ok(resp
+            .result
+            .points
             .into_iter()
             .filter_map(to_memory_scored)
             .collect())
@@ -477,21 +616,17 @@ impl Qdrant {
     }
 
     pub async fn ensure_indexes(&self) -> Result<()> {
+        self.ensure_indexes_for(&TEXT_INDEXES).await
+    }
+
+    /// Self-provision the collection, then create the given payload indexes
+    /// (idempotent — Qdrant accepts re-creation as a no-op).
+    pub async fn ensure_indexes_for(&self, fields: &[(&str, &str)]) -> Result<()> {
         // Self-provision the collection first, so a fresh deploy with any
         // COLLECTION name works with no manual Qdrant step.
         self.ensure_collection().await?;
         let url = self.url("/index?wait=true");
-        let fields: [(&str, &str); 8] = [
-            ("wing", "keyword"),
-            ("category", "keyword"),
-            ("room", "keyword"),
-            ("hall", "keyword"),
-            ("author", "keyword"),
-            ("timestamp", "datetime"),
-            ("valid_until", "datetime"),
-            ("event_time", "datetime"),
-        ];
-        for (field, schema) in fields {
+        for &(field, schema) in fields {
             let body = json!({ "field_name": field, "field_schema": schema });
             let resp = self.client.put(&url).json(&body).send().await?;
             if !resp.status().is_success() {
@@ -501,6 +636,128 @@ impl Qdrant {
             }
         }
         Ok(())
+    }
+    // ---- Raw-JSON payload access ------------------------------------------
+    // The text collection's payload is the typed `Payload`; the image
+    // collection carries a different shape, so it goes through these.
+    // Only the image palace (fastembed builds) uses them.
+
+    /// Upsert points whose payload is arbitrary JSON.
+    #[cfg(feature = "fastembed")]
+    pub async fn upsert_raw(&self, points: Vec<(u64, Vec<f32>, Value)>) -> Result<()> {
+        if points.is_empty() {
+            return Ok(());
+        }
+        let url = self.url("/points?wait=true");
+        let pts: Vec<Value> = points
+            .into_iter()
+            .map(|(id, vector, payload)| json!({"id": id, "vector": vector, "payload": payload}))
+            .collect();
+        let resp = self
+            .client
+            .put(&url)
+            .json(&json!({ "points": pts }))
+            .send()
+            .await
+            .with_context(|| format!("PUT {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("qdrant upsert {status}: {text}"));
+        }
+        Ok(())
+    }
+
+    /// Vector search returning `(id, score, payload)`.
+    #[cfg(feature = "fastembed")]
+    pub async fn search_raw(
+        &self,
+        vector: Vec<f32>,
+        limit: u32,
+        filter: &FindFilter,
+    ) -> Result<Vec<(u64, f32, Value)>> {
+        let url = self.url("/points/query");
+        let body = query_body(vector, limit, filter);
+        let resp: ResultWrapper<QueryResult<Value>> = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .context("qdrant search status")?
+            .json()
+            .await
+            .context("qdrant search decode")?;
+        Ok(resp
+            .result
+            .points
+            .into_iter()
+            .filter_map(|p| {
+                let id = id_as_u64(p.get("id")?)?;
+                let score = p.get("score")?.as_f64()? as f32;
+                Some((id, score, p.get("payload")?.clone()))
+            })
+            .collect())
+    }
+
+    /// Fetch `(id, payload)` for existing IDs; missing IDs are skipped.
+    #[cfg(feature = "fastembed")]
+    pub async fn retrieve_raw(&self, ids: Vec<u64>) -> Result<Vec<(u64, Value)>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let url = self.url("/points");
+        let resp: ResultWrapper<Vec<Value>> = self
+            .client
+            .post(&url)
+            .json(&json!({ "ids": ids, "with_payload": true }))
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .context("qdrant retrieve status")?
+            .json()
+            .await
+            .context("qdrant retrieve decode")?;
+        Ok(resp
+            .result
+            .into_iter()
+            .filter_map(|p| Some((id_as_u64(p.get("id")?)?, p.get("payload")?.clone())))
+            .collect())
+    }
+
+    /// ID of the first point whose keyword payload `key` equals `value`.
+    /// Exact match on an indexed field — used for content-hash dedup.
+    #[cfg(feature = "fastembed")]
+    pub async fn first_id_where(&self, key: &str, value: &str) -> Result<Option<u64>> {
+        let url = self.url("/points/scroll");
+        let body = json!({
+            "limit": 1,
+            "with_payload": false,
+            "with_vector": false,
+            "filter": { "must": [ { "key": key, "match": { "value": value } } ] },
+        });
+        let resp: ResultWrapper<Value> = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .context("qdrant scroll status")?
+            .json()
+            .await
+            .context("qdrant scroll decode")?;
+        Ok(resp
+            .result
+            .get("points")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|p| p.get("id"))
+            .and_then(id_as_u64))
     }
 }
 
@@ -541,6 +798,8 @@ fn hydrate(id: u64, score: Option<f32>, pl: Payload) -> Memory {
         supersedes: pl.supersedes,
         superseded_by: pl.superseded_by,
         superseded_reason: pl.superseded_reason,
+        external_id: pl.external_id,
+        meta: pl.meta,
     }
 }
 
@@ -564,6 +823,8 @@ fn to_export_point(p: ScrolledPoint) -> Option<ExportPoint> {
         supersedes: pl.supersedes,
         superseded_by: pl.superseded_by,
         superseded_reason: pl.superseded_reason,
+        external_id: pl.external_id,
+        meta: pl.meta,
         vector: p.vector,
     })
 }
@@ -649,9 +910,12 @@ mod tests {
         let q = f.to_qdrant_filter().unwrap();
         assert!(q.get("must").is_none());
         let must_not = q["must_not"].as_array().unwrap();
-        assert_eq!(must_not.len(), 1);
+        assert_eq!(must_not.len(), 2);
         assert_eq!(must_not[0]["key"], "valid_until");
         assert_eq!(must_not[0]["range"]["lte"], "2026-06-10T00:00:00Z");
+        // not-yet-valid points are hidden too
+        assert_eq!(must_not[1]["key"], "valid_from");
+        assert_eq!(must_not[1]["range"]["gt"], "2026-06-10T00:00:00Z");
     }
 
     fn payload_json(text: &str) -> serde_json::Value {
@@ -692,7 +956,7 @@ mod tests {
     async fn search_decodes_numeric_and_string_ids() {
         let mock = MockQdrant::start().await;
         mock.push(
-            "POST /points/search",
+            "POST /points/query",
             json!({"result": [
                 {"id": 7, "score": 0.9, "payload": payload_json("a")},
                 {"id": "12", "score": 0.8, "payload": payload_json("b")},
@@ -725,6 +989,37 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, 1);
         assert_eq!(got[0].text, "kept");
+    }
+
+    #[tokio::test]
+    async fn api_key_sent_on_every_request_and_absent_without_one() {
+        let mock = MockQdrant::start().await;
+        let q = Qdrant::with_api_key(&mock.url, "c", Some("s3cret".into()));
+        q.ensure_indexes().await.unwrap();
+        q.search(vec![0.0; 768], 1, &FindFilter::default())
+            .await
+            .unwrap();
+        q.count(&FindFilter::default()).await.unwrap();
+        q.delete(&[1]).await.unwrap();
+        let keys = mock.api_keys();
+        assert!(keys.len() > 4);
+        assert!(
+            keys.iter().all(|k| k.as_deref() == Some("s3cret")),
+            "{keys:?}"
+        );
+
+        let mock = MockQdrant::start().await;
+        Qdrant::with_api_key(&mock.url, "c", None)
+            .count(&FindFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(mock.api_keys(), vec![None]);
+    }
+
+    #[test]
+    fn api_key_header_is_sensitive_in_debug_output() {
+        let q = Qdrant::with_api_key("http://127.0.0.1:9", "c", Some("s3cret".into()));
+        assert!(!format!("{:?}", q.client).contains("s3cret"));
     }
 
     #[tokio::test]

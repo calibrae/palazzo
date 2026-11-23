@@ -1,15 +1,22 @@
 mod auth;
 mod baselines;
+mod docs;
 mod embed;
 mod embeddings;
+mod image_args;
+#[cfg(feature = "fastembed")]
+mod images;
 mod mcp;
 mod oauth;
 mod qdrant;
 mod ratelimit;
 mod schema;
+mod svctoken;
 #[cfg(test)]
 mod testmock;
 mod util;
+#[cfg(feature = "fastembed")]
+mod vision;
 mod wal;
 
 #[cfg(all(feature = "ollama", feature = "fastembed"))]
@@ -104,6 +111,10 @@ fn make_tracker() -> Tracker {
     Tracker::new(usage_log_path(), gain_enabled(), baselines::BASELINES)
 }
 
+/// `<crate version>+<8-char commit>` (see build.rs), e.g. `0.14.2+4aafed5a`. The
+/// `+` suffix is semver build metadata, so it matches the `palazzo-<sha>` image tag.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PALAZZO_GIT_SHA"));
+
 const BACKEND: &str = if cfg!(feature = "fastembed") {
     "fastembed:NomicEmbedTextV15Q"
 } else {
@@ -118,6 +129,33 @@ fn make_embedder(cfg: &Config) -> Result<Embedder> {
 #[cfg(feature = "fastembed")]
 fn make_embedder(_cfg: &Config) -> Result<Embedder> {
     Embedder::new()
+}
+
+/// Attach image memories (separate `<COLLECTION>-images` collection) when
+/// PALAZZO_VISION is on. Provisioning failures are logged, not fatal — same
+/// policy as the text collection's ensure_indexes.
+#[cfg(feature = "fastembed")]
+async fn attach_images(cfg: &Config, palace: Palace) -> Palace {
+    if !crate::vision::enabled() {
+        return palace;
+    }
+    let coll = crate::images::collection_name(&cfg.collection);
+    let ip = crate::images::ImagePalace::new(
+        crate::vision::VisionEmbedder::new(),
+        palace.embedder_arc(),
+        Qdrant::new(&cfg.qdrant_url, &coll),
+        palace.wal_arc(),
+    );
+    if let Err(e) = ip.ensure_indexes().await {
+        tracing::warn!(collection = %coll, "image collection ensure_indexes: {e:#}");
+    }
+    tracing::info!(collection = %coll, "image memories enabled (palace_*_image tools, POST /images)");
+    palace.with_images(ip)
+}
+
+#[cfg(not(feature = "fastembed"))]
+async fn attach_images(_cfg: &Config, palace: Palace) -> Palace {
+    palace
 }
 
 fn print_help() {
@@ -166,7 +204,7 @@ Environment:
   PALAZZO_GAIN_ENABLED (default 1; set 0/false/no/off to disable per-call recording)
   RUST_LOG      (default palazzo=info)
 ",
-        env!("CARGO_PKG_VERSION")
+        VERSION
     );
 }
 
@@ -188,12 +226,13 @@ async fn main() -> Result<()> {
         Some("warm") => run_warm().await,
         Some("gain") => run_gain(&args[1..]),
         Some("ingest") => run_ingest(&args[1..]).await,
+        Some("service-token") => crate::svctoken::run_cli(&args[1..]).await,
         Some("--help" | "-h") => {
             print_help();
             Ok(())
         }
         Some("--version" | "-V") => {
-            println!("palazzo {}", env!("CARGO_PKG_VERSION"));
+            println!("palazzo {VERSION}");
             Ok(())
         }
         Some(other) => {
@@ -207,7 +246,12 @@ async fn main() -> Result<()> {
 async fn run_warm() -> Result<()> {
     let cfg = Config::from_env();
     let _ = make_embedder(&cfg)?;
-    tracing::info!("fastembed model warmed into cache; exiting");
+    tracing::info!("fastembed model warmed into cache");
+    #[cfg(feature = "fastembed")]
+    if vision::enabled() {
+        let _ = vision::build_model()?;
+        tracing::info!("vision model (nomic-embed-vision-v1.5) warmed into cache");
+    }
     Ok(())
 }
 
@@ -366,6 +410,56 @@ async fn run_ingest(rest: &[String]) -> Result<()> {
 /// The payload bytes flow through the HTTP body and never need to enter an MCP
 /// transcript. Use this from agents for bulk migrations: `Bash(curl --data-binary)`
 /// only puts the curl command in the conversation, not the file content.
+/// `POST /images` — NDJSON, one `palace_store_image` item per line (max 16).
+/// Stores sequentially (vision inference is CPU-heavy) and answers with a
+/// per-item result plus counts.
+#[cfg(feature = "fastembed")]
+async fn images_handler(
+    axum::extract::State(palace): axum::extract::State<std::sync::Arc<Palace>>,
+    identity: Option<axum::Extension<crate::auth::AuthIdentity>>,
+    body: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(ip) = palace.images() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            "image memories are disabled (set PALAZZO_VISION=1)\n",
+        )
+            .into_response();
+    };
+    let items = match crate::images::parse_ndjson(&body) {
+        Ok(i) => i,
+        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, format!("{e}\n")).into_response(),
+    };
+    let author = identity.map(|axum::Extension(a)| a.0);
+    let (mut stored, mut duplicates, mut failed) = (0u32, 0u32, 0u32);
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        match ip.store(item, author.clone()).await {
+            Ok(r) => {
+                if r.duplicate_of.is_some() {
+                    duplicates += 1;
+                } else {
+                    stored += 1;
+                }
+                out.push(serde_json::json!({"index": index, "ok": true, "result": r}));
+            }
+            Err(e) => {
+                failed += 1;
+                out.push(
+                    serde_json::json!({"index": index, "ok": false, "error": format!("{e:#}")}),
+                );
+            }
+        }
+    }
+    axum::Json(serde_json::json!({
+        "collection": ip.collection(),
+        "items": out,
+        "counts": {"stored": stored, "duplicates": duplicates, "failed": failed},
+    }))
+    .into_response()
+}
+
 async fn ingest_handler(
     axum::extract::State(palace): axum::extract::State<std::sync::Arc<Palace>>,
     identity: Option<axum::Extension<crate::auth::AuthIdentity>>,
@@ -497,7 +591,7 @@ async fn stats_handler(
     match palace.do_status().await {
         Ok(mut v) => {
             if let Some(obj) = v.as_object_mut() {
-                obj.insert("version".into(), env!("CARGO_PKG_VERSION").into());
+                obj.insert("version".into(), VERSION.into());
                 obj.insert("embedder".into(), BACKEND.into());
             }
             axum::Json(v).into_response()
@@ -526,7 +620,7 @@ async fn health_handler(
     // handler implies it loaded; report the backend rather than a fake status.
     axum::Json(serde_json::json!({
         "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": VERSION,
         "qdrant": qdrant,
         "embedder": BACKEND,
     }))
@@ -672,7 +766,7 @@ async fn run_stdio() -> Result<()> {
         tracing::warn!("ensure_indexes: {e:#}");
     }
 
-    let palace = cfg.make_palace()?;
+    let palace = attach_images(&cfg, cfg.make_palace()?).await;
     let service = palace.serve(stdio()).await.inspect_err(|e| {
         tracing::error!("mcp serve: {e:?}");
     })?;
@@ -773,7 +867,11 @@ async fn run_http(rest: &[String]) -> Result<()> {
     // under rmcp 3.x's stateless streamable-HTTP transport: the service factory runs
     // per REQUEST, so building a Palace per call would spin up a fresh reqwest/Qdrant
     // client on every tool call. Build once, clone in.
-    let palace = cfg.make_palace_with_embedder(shared_embedder.clone())?;
+    let palace = attach_images(
+        &cfg,
+        cfg.make_palace_with_embedder(shared_embedder.clone())?,
+    )
+    .await;
     let ingest_palace = std::sync::Arc::new(palace.clone());
     // Clone for the /v1/embeddings route. Embedder::Clone shares the inner model Arc.
     let embed_for_v1 = shared_embedder.clone();
@@ -842,7 +940,50 @@ async fn run_http(rest: &[String]) -> Result<()> {
     // gated like /find (auth when PALAZZO_AUTH=email, open otherwise).
     let mut stats_route = axum::Router::new()
         .route("/stats", axum::routing::get(stats_handler))
-        .with_state(ingest_palace);
+        .with_state(ingest_palace.clone());
+    // POST /images — NDJSON bulk store of image memories (the /ingest of the
+    // image collection). Mounted only when image memories are on; gated like
+    // /ingest when PALAZZO_AUTH=email.
+    #[cfg(feature = "fastembed")]
+    let mut images_route = if ingest_palace.images().is_some() {
+        axum::Router::new()
+            .route("/images", axum::routing::post(images_handler))
+            .layer(axum::extract::DefaultBodyLimit::max(
+                crate::vision::MAX_BODY_BYTES,
+            ))
+            .with_state(ingest_palace.clone())
+    } else {
+        axum::Router::new()
+    };
+    #[cfg(not(feature = "fastembed"))]
+    let mut images_route = axum::Router::new();
+    // Service /docs API: verifies Ed25519 service tokens against the public keys
+    // baked into the build (service-trust.pub) or PALAZZO_SERVICE_PUBKEYS. No key
+    // → 404 not_enabled. Tokens are minted offline by the private-key holder.
+    let docs_keys = match crate::svctoken::trusted_pubkeys() {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("service token public keys invalid, service /docs API DISABLED: {e:#}");
+            Vec::new()
+        }
+    };
+    let docs_verifier = std::sync::Arc::new(crate::svctoken::Verifier::new(
+        docs_keys,
+        cfg.collection.clone(),
+        crate::svctoken::default_revoked_path(),
+    ));
+    tracing::info!(
+        enabled = docs_verifier.is_enabled(),
+        trusted_keys = docs_verifier.key_count(),
+        audience = %cfg.collection,
+        "service /docs API"
+    );
+    let docs_route = crate::docs::router(crate::docs::DocsState::new(
+        ingest_palace.embedder_arc(),
+        std::sync::Arc::new(cfg.make_qdrant()),
+        ingest_palace.wal_arc(),
+        docs_verifier,
+    ));
     let health_route = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
         .with_state(health_state);
@@ -857,6 +998,10 @@ async fn run_http(rest: &[String]) -> Result<()> {
             async move { body }
         }),
     );
+    #[cfg(feature = "fastembed")]
+    let vision_on = crate::vision::enabled();
+    #[cfg(not(feature = "fastembed"))]
+    let vision_on = false;
     let embeddings_route = axum::Router::new()
         .route(
             "/v1/embeddings",
@@ -864,9 +1009,39 @@ async fn run_http(rest: &[String]) -> Result<()> {
         )
         .route(
             "/v1/models",
-            axum::routing::get(crate::embeddings::models_handler),
+            axum::routing::get(move || async move {
+                axum::Json(crate::embeddings::models_body(vision_on))
+            }),
         )
         .with_state(embed_for_v1);
+    // POST /v1/image-embeddings — opt-in (PALAZZO_VISION), open like /v1/embeddings.
+    // Own body cap: images are far larger than the default 2 MB axum limit.
+    #[cfg(feature = "fastembed")]
+    let embeddings_route = if vision_on {
+        tracing::info!(
+            max_images = crate::vision::MAX_IMAGES,
+            max_image_bytes = crate::vision::MAX_IMAGE_BYTES,
+            "POST /v1/image-embeddings enabled (model loads on first request)"
+        );
+        embeddings_route.merge(
+            axum::Router::new()
+                .route(
+                    "/v1/image-embeddings",
+                    axum::routing::post(crate::vision::image_embeddings_handler),
+                )
+                .with_state(
+                    ingest_palace
+                        .images()
+                        .map(|ip| ip.vision().clone())
+                        .unwrap_or_else(crate::vision::VisionEmbedder::new),
+                )
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::vision::MAX_BODY_BYTES,
+                )),
+        )
+    } else {
+        embeddings_route
+    };
 
     // MCP, ingest, find, and stats are gated with the bearer middleware when
     // attribution is enabled. /whoami (token mint), /health, /metrics, /export,
@@ -888,6 +1063,10 @@ async fn run_http(rest: &[String]) -> Result<()> {
             crate::auth::require_auth,
         ));
         stats_route = stats_route.layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_auth,
+        ));
+        images_route = images_route.layer(axum::middleware::from_fn_with_state(
             auth.clone(),
             crate::auth::require_auth,
         ));
@@ -939,6 +1118,8 @@ async fn run_http(rest: &[String]) -> Result<()> {
         .merge(ingest_route)
         .merge(find_route)
         .merge(stats_route)
+        .merge(images_route)
+        .merge(docs_route)
         .merge(health_route)
         .merge(export_route)
         .merge(metrics_route)
@@ -966,4 +1147,20 @@ async fn run_http(rest: &[String]) -> Result<()> {
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn version_carries_commit_suffix() {
+        let (semver, sha) = super::VERSION
+            .split_once('+')
+            .expect("version has a +sha suffix");
+        assert_eq!(semver, env!("CARGO_PKG_VERSION"));
+        let core = sha.strip_suffix("-dirty").unwrap_or(sha);
+        assert!(
+            core == "unknown" || (core.len() == 8 && core.chars().all(|c| c.is_ascii_hexdigit())),
+            "unexpected commit suffix {sha:?}"
+        );
+    }
 }

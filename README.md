@@ -24,7 +24,7 @@ A single-binary Rust MCP server that:
 
 - Speaks MCP over **stdio** (run locally) or **Streamable HTTP** (run as a service for a team or a homelab)
 - Embeds text via one of two backends — local ONNX (`fastembed-rs`, fully self-contained) or a remote Ollama (`nomic-embed-text`). Either way: 768-dim, same vector space.
-- Stores and retrieves points in [Qdrant](https://qdrant.tech/) with a **structured palace schema** (wing → room → hall) and **temporal validity** (`valid_until` / `superseded_by`) so the palace is a journal, not a snapshot
+- Stores and retrieves points in [Qdrant](https://qdrant.tech/) (**≥ 1.10**: search uses the Query API, `POST /points/query`; tested up to 1.20) with a **structured palace schema** (wing → room → hall) and **temporal validity** (`valid_until` / `superseded_by`) so the palace is a journal, not a snapshot
 - Detects near-duplicates before writing (cosine ≥ 0.95 + exact text match)
 - Keeps an append-only JSONL write-ahead log for every mutation
 
@@ -52,6 +52,9 @@ Neither upstream is vendored. Both are linked above; please follow and star thei
 | `palace_delete_by_filter` | **MASS-DESTRUCTIVE — hard-delete every point matching a filter** (wing / category / room / hall / since / until). Required `confirm: true` + `reason`. Two-step flow: `dry_run: true` to learn the count, then real call with `expected_count` matching exactly. Cap: 1000 per call. WAL-logs every deletion. |
 | `palace_store_batch` | Bulk-ingest up to 256 memories in one call. Embeds the whole batch in one ONNX/Ollama inference pass and bulk-upserts to Qdrant in one HTTP call (~3-5× faster than N single-item calls). Per-item dedup against the live palace; result returns per-item status, IDs, and dedup hits. Designed for migrations and bulk imports. |
 | `palace_gain` | Token-savings report. Aggregates the per-tool gain log and returns a `Summary` of how many tokens of agent context this server saved versus a hand-coded SSH+curl+jq equivalent. Optional `since` (RFC3339) and `include_text` flags. |
+| `palace_store_image` | _(opt-in, `PALAZZO_VISION=1`)_ File an **image memory** into the separate image collection: base64 image, required `source` reference, wing/room/hall/category, optional caption and `event_time`. Stores the vector and metadata, never the bytes. Identical images (SHA-256) return the existing ID. Prefer `POST /images` for anything bigger than a small screenshot. |
+| `palace_find_images` | _(opt-in)_ Search image memories by **text description**, ranked only against images. Same filters as `palace_find` (`wing` / `category` / `room` / `hall` / `author` / `since` / `until` / `time_field`). |
+| `palace_delete_images` | _(opt-in)_ **DESTRUCTIVE.** Hard-delete image memories by ID, with the same `confirm` + `reason` + WAL-before-delete rules as `palace_delete`. Cap: 100 IDs per call. |
 
 Input caps: 32 KB per text body, 100 IDs per recall batch, 1–20 results per find.
 
@@ -111,7 +114,10 @@ All via environment variables:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `QDRANT_URL` | `http://localhost:6333` | |
+| `QDRANT_URL` | `http://localhost:6333` | Qdrant ≥ 1.10 |
+| `QDRANT_API_KEY` | _(unset)_ | Qdrant API key, sent as the `api-key` header on every Qdrant request. Unset means no key, for a Qdrant without auth. The header is marked sensitive and never logged. |
+| `PALAZZO_SERVICE_PUBKEYS` | _(build: `service-trust.pub`)_ | Trusted Ed25519 public keys (base64, comma-separated) for `/docs` service tokens. Overrides the baked-in list; empty = none (API off). |
+| `PALAZZO_SERVICE_REVOKED_FILE` | `/var/lib/palazzo/service-revoked.txt` | Revoked service-token jtis, written by `POST /admin/service-tokens/revoke`. |
 | `COLLECTION` | `claude-memory` | |
 | `PALAZZO_WAL` | `~/.palazzo/wal.jsonl` | |
 | `PALAZZO_BIND` | `127.0.0.1:6334` | only used by `serve` |
@@ -122,6 +128,8 @@ All via environment variables:
 | `PALAZZO_USAGE_LOG` | `/var/lib/palazzo/usage.jsonl` | append-only JSONL backing `palace_gain` |
 | `PALAZZO_GAIN_ENABLED` | `1` | set to `0`/`false`/`no`/`off` to disable per-call recording |
 | `PALAZZO_MAX_INGEST_BYTES` | `67108864` (64 MiB) | body cap for `POST /ingest` (32 KB/item still enforced) |
+| `PALAZZO_VISION` | _(off)_ | `1` enables image support: `POST /v1/image-embeddings`, image memories (`palace_*_image` tools, `POST /images`) and makes `palazzo warm` fetch the vision model |
+| `PALAZZO_IMAGE_COLLECTION` | `<COLLECTION>-images` | Qdrant collection for image memories (only with `PALAZZO_VISION=1`) |
 | `PALAZZO_LEGACY_SESSION_MODE` | `true` | Streamable HTTP: keep stateful sessions for legacy MCP clients (they open a `GET /mcp` SSE stream). `false` = sessionless |
 | `PALAZZO_AUTH` | `off` | `off` = no auth; `email` = built-in OAuth 2.1 server + per-write email attribution (see [Authentication](#authentication-optional)) |
 | `PALAZZO_AUTH_SIGNING_KEY` | — | required when `PALAZZO_AUTH=email`; ≥ 16 bytes (e.g. `openssl rand -base64 48`). Rotating it invalidates every live token |
@@ -279,7 +287,7 @@ curl http://palazzo-host:6334/stats
 
 ```
 {"collection":"claude-memory","total":3353,
- "wings":{"projects":143,"infrastructure":17,"nexpublica":14,...},
+ "wings":{"projects":143,"infrastructure":17,"work":14,...},
  "halls":{"facts":111,"events":55,"decisions":20,...},
  "categories":{"technical":...,"project":...,...},
  "version":"0.14.2","embedder":"fastembed:NomicEmbedTextV15Q"}
@@ -313,7 +321,93 @@ curl http://palazzo-host:6334/v1/embeddings -X POST -H 'content-type: applicatio
 
 Response is the standard `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[...]}],"model":...}`. `input` accepts a bare string or an array of strings; `model` is echoed back (palazzo runs a single model, so the value is informational).
 
-**Prefix asymmetry.** nomic-embed-text-v1.5 wants `search_query:` / `search_document:` instruction prefixes, which this endpoint applies server-side keyed off the optional `input_type` field (`"query"` | `"document"`, default `document`). Note this is a **different vector space** from the palace's own memories: `palace_*` embeds prefix-free to stay compatible with the existing `claude-memory` collection, while `/v1/embeddings` is prefixed for retrieval quality — never mix the two in one collection. Caps: 512 inputs/request, 32 KB/item. Same `PALAZZO_ALLOWED_HOSTS` allowlist as `/mcp`.
+**Prefix asymmetry.** nomic-embed-text-v1.5 wants `search_query:` / `search_document:` instruction prefixes, which this endpoint applies server-side. The optional `input_type` field (`"query"` | `"document"`) picks one. Stock OpenAI clients can't send extra fields, so the model name works too: `nomic-embed-text-query` gets the query prefix, and `nomic-embed-text` / `nomic-embed-text-document` get the document prefix (the default). `input_type` wins when both are given, and `/v1/models` lists all three names. Responses carry an OpenAI `usage` block; palazzo doesn't count tokens, so both counts are 0. Token-array `input` isn't supported: with LangChain's `OpenAIEmbeddings`, set `check_embedding_ctx_length=False` so it sends strings. Note this is a **different vector space** from the palace's own memories: `palace_*` embeds prefix-free to stay compatible with the existing `claude-memory` collection, while `/v1/embeddings` is prefixed for retrieval quality — never mix the two in one collection. Caps: 512 inputs/request, 32 KB/item. Same `PALAZZO_ALLOWED_HOSTS` allowlist as `/mcp`.
+
+### Image embeddings (`POST /v1/image-embeddings`, opt-in)
+
+With `PALAZZO_VISION=1`, palazzo also serves [nomic-embed-vision-v1.5](https://huggingface.co/nomic-ai/nomic-embed-vision-v1.5), which was trained into the **same 768-dim space as nomic-embed-text-v1.5**. An image vector is directly comparable to a text vector from `POST /v1/embeddings` with `"input_type":"query"`, so you can search images with text, or find documents that match an image. Nothing is stored.
+
+```
+curl http://palazzo-host:6334/v1/image-embeddings -X POST -H 'content-type: application/json' \
+  -d '{"input":["data:image/png;base64,iVBORw0KGgo...", "<raw base64 jpeg>"]}'
+```
+
+The response has the same shape as `/v1/embeddings`, with `model` set to `nomic-embed-vision-v1.5`. `input` is a string or an array; each item is raw base64 or a `data:image/...;base64,` URL.
+
+- **Formats:** PNG, JPEG, WebP, GIF. Anything else gets a `400`.
+- **Caps:** 16 images per request, 8 MiB per decoded image, 40 MP per image. The pixel cap is read from the header before anything is decoded, so a small file can't inflate into a huge bitmap. The route has its own body cap, sized for the worst case.
+- **Cost:** the model is 368 MB on disk and adds a few hundred MB of RSS once loaded. It loads on the **first** image request (expect a few seconds), then takes roughly a second per large image on CPU. It has its own lock, so image traffic never queues behind text embeds.
+- **Scores:** text↔image cosines are small in absolute terms (≈0.03–0.10), while text↔text and image↔image run 0.5–0.8. Rank within one modality, and keep images in a **separate collection** from text: in a mixed collection, text documents will always outrank images.
+- **Language:** the text side is English-first. English queries match images well; French queries are noticeably weaker. Translate the query first if precision matters.
+- **Deploy:** `palazzo warm` also fetches the vision model when `PALAZZO_VISION=1` is set. For `Dockerfile.cloud`, build with `--build-arg PALAZZO_VISION=1` to bake it in (the default image carries only the text model).
+
+### Image memories (`palace_*_image` tools, `POST /images`, opt-in)
+
+`PALAZZO_VISION=1` also turns on **image memories**: a separate Qdrant collection, `<COLLECTION>-images` (override with `PALAZZO_IMAGE_COLLECTION`), created on startup like the main one. Images live apart from text memories on purpose. The vision space lines up with *prefixed* text queries, while the palace embeds without prefixes, and text↔image scores are an order of magnitude below text↔text, so in a shared collection images would always rank last.
+
+- **What's stored:** the nomic-embed-vision-v1.5 vector plus `source` (where the image lives: URL, path or reference), wing/room/hall/category, optional `caption` and `event_time`, and `sha256`, `format`, `width`, `height`, `bytes`, `timestamp` and `author`. **Never the image bytes.**
+- **Dedup:** exact SHA-256 of the bytes. Re-storing the same image returns the existing ID without embedding it again.
+- **Search:** `palace_find_images` embeds the text query with the `search_query:` prefix and ranks it against images only. Scores of ~0.03–0.10 are real matches, so compare them with each other, not with `palace_find` scores. English queries work best.
+- **Bulk upload:** `POST /images` takes NDJSON, one `palace_store_image` item per line, max 16 per request, and returns per-item results plus counts. It sits behind the same auth gate as `/ingest`. Base64 passed as MCP tool arguments costs a lot of context; through curl, the bytes never touch the transcript:
+
+```
+curl -X POST http://palazzo-host:6334/images -H 'Content-Type: application/x-ndjson' --data-binary @images.ndjson
+# {"collection":"claude-memory-images","counts":{"stored":2,"duplicates":1,"failed":0},"items":[...]}
+```
+
+Without `PALAZZO_VISION`, none of this is mounted: the three tools are removed from the MCP tool list and `/images` doesn't exist.
+
+### Service document API (`/docs`, opt-in)
+
+For services that own their documents (not MCP agents): write, replace and retract documents by **your own stable key**, in one wing bound to a token. **No deployment config and no cluster access:** tokens are Ed25519-signed and minted offline by whoever holds the private key.
+
+```
+# on the operator's machine (private key: ~/.config/palazzo/service-signing.key or --key / PALAZZO_SERVICE_SIGNING_KEY_FILE)
+palazzo service-token mint --name my-svc --wing my-svc --mode rw            # prints the token
+palazzo service-token mint --name my-svc-ro --wing my-svc --mode ro --aud my-collection --days 90
+palazzo service-token inspect <token>                                         # claims, incl. jti
+palazzo service-token revoke --url https://<instance> <jti>                  # over HTTP, effective immediately
+palazzo service-token pubkey                                                  # public key of --key
+```
+
+- **Trust:**
+  - The server accepts tokens signed by any public key in `service-trust.pub`, which build.rs bakes into the binary.
+  - `PALAZZO_SERVICE_PUBKEYS` overrides that list; set it empty to trust nothing.
+  - No trusted key → every `/docs` call answers 404 `not_enabled`.
+  - The private key never goes near the server. To rotate, add the new public key to the trust file, deploy, re-mint, then drop the old key.
+- **Service tokens:**
+  - Bound to **one wing** and a mode: `rw` (writes + reads) or `ro` (reads).
+  - Optional `--aud <collection>` limits a token to one instance; without it, the token works on every instance that trusts the key.
+  - 365 days by default (`--days N`, `--no-expiry`).
+- **Revocation:**
+  - `revoke --url` mints a 10-minute **admin token** and calls `POST /admin/service-tokens/revoke {"jti"}`.
+  - Revoked jtis are stored on the instance's state volume (`PALAZZO_SERVICE_REVOKED_FILE`, default `/var/lib/palazzo/service-revoked.txt`).
+  - `GET /admin/service-tokens/revoked` lists them.
+  - Admin tokens live at most 1 h and are only accepted on these routes. Revoke on each instance a token was used against.
+- **Logging:** revocations are WAL-logged by jti; tokens are never logged.
+- Requests use `Authorization: Bearer <token>`.
+
+| Route | Token | Does |
+|---|---|---|
+| `PUT /docs/{external_id}` | rw | Create or update. Body: `{text, room, hall, category, meta?, valid_from?, valid_until?, event_time?}`. The wing is always the token's; any other field is a 400. |
+| `GET /docs/{external_id}` | ro/rw | The current version: `id` + the same keys as a `/find` hit. |
+| `DELETE /docs/{external_id}?reason=…` | rw | Hard-deletes **every** version of the key (current + superseded history), each WAL-logged with its full payload first. |
+| `POST /docs/batch` | rw | `{"items": [{external_id, …same fields}]}`, up to 256, applied in order. Returns per-item results + counts. |
+| `POST /docs/delete` | rw | `{"external_ids": […], "reason"?}`, up to 256. Returns `{deleted: [{external_id, ids}], missing: […]}`. |
+| `POST /docs/search` | ro/rw | Scoped search in the token's wing. Body: `{"query", "scope": ["<room>:<hall>" \| "<room>:*", …], "limit"?, "category"?: […]}`. **`scope` is mandatory** (up to 1000 pairs), and the request is refused without it. Returns the same array as `/find` (best first, with `external_id` and `meta`). `limit` is 1–20, default 10. Same embedding as `palace_find`. |
+
+- **Keyed identity:** `external_id` (1–128 chars of `[A-Za-z0-9._:@-]`) is unique among the wing's *current* points. `PUT` returns `status`:
+  - `created`
+  - `unchanged`: same text and metadata
+  - `updated`: same text, new metadata; the payload is rewritten in place, no re-embed
+  - `replaced`: new text; a new point is created and the old one is superseded and kept for audit, with `replaced_id` returned
+
+  This path does no cosine dedup.
+- **`meta`:** string → string, at most 2 KB as JSON, keys up to 64 bytes. Stored and returned verbatim (in `/find` hits too), never embedded.
+- **Validity:** `valid_from`/`valid_until` are RFC3339 UTC, and `valid_until` must be after `valid_from`. Default searches (`/docs/search`, `/find`, `palace_find`) show only current truth: a past `valid_until` (expired or superseded) or a future `valid_from` (not yet valid) hides the point.
+- **Errors:** always `{"error": {"code", "message"}}`. Codes: `bad_request` (400), `unauthorized` (401: missing, invalid, expired or revoked token), `forbidden` (403: a ro token on a write), `not_found` (404), `not_enabled` (404: no trusted public key), `internal` (500).
+- **Visibility:** the wing is *readable by everyone* through the instance's normal `/find` and MCP tools. Tokens control who can write it, not who can read it.
+- Points are stamped `author: "service:<name>"`. Assumes a single replica: writes to one key are serialised in-process.
 
 ### Bulk ingest from a file (`palazzo ingest`)
 
@@ -355,7 +449,7 @@ docker build -f Dockerfile.cloud -t palazzo:latest .
 ```
 
 - **Runtime base:** Chainguard `glibc-dynamic` — glibc, libstdc++, libgcc_s and CA certificates only. No shell, no package manager, no curl; a vulnerability scan of the base comes back clean.
-- **Model baked in** at build time (a throwaway Debian stage runs `palazzo warm`), so the container needs no HuggingFace egress at runtime.
+- **Model baked in** at build time (a throwaway Debian stage runs `palazzo warm`), so the container needs no HuggingFace egress at runtime Add `--build-arg PALAZZO_VISION=1` to also bake the vision model (+~370 MB) for deployments that enable image embeddings.
 - Runs as **uid/gid 1000**; state (WAL, usage log, model cache) under `/var/lib/palazzo` — mount a volume there and set `fsGroup: 1000`.
 - **No Docker `HEALTHCHECK`** (there is no curl inside). Use your orchestrator's HTTP probe on `GET /health` instead, e.g. Kubernetes `readinessProbe`/`livenessProbe` with `httpGet: {path: /health, port: 6334}`.
 
@@ -417,13 +511,14 @@ python3 scripts/smoke.py
 
 It creates `palazzo-test`, boots the binary, round-trips store / find / recall / status / check_duplicate / duplicate-skip / filtered find / since-until / recency-boost / supersede / superseded-hidden / superseded-surfaced / recall-temporal-metadata, and drops the collection. Fails loudly on any mismatch.
 
-Requires live Qdrant and (for the `ollama` backend) Ollama reachable at the configured URLs. The `fastembed` backend has no external service requirement once the model cache is warm.
+Requires live Qdrant (≥ 1.10; set `QDRANT_API_KEY` if it enforces a key, and the script sends it too) and, for the `ollama` backend, Ollama reachable at the configured URLs. Point it at a throwaway Qdrant (e.g. `docker run -p 6333:6333 qdrant/qdrant`), never a production one. The `fastembed` backend has no external service requirement once the model cache is warm.
 
 ## Security notes
 
 - Stdio transport: single-user threat model, no network listener. `serve` (Streamable HTTP) binds `127.0.0.1` by default; auth is opt-in via `PALAZZO_AUTH=email` (attribution + domain allow-list, not per-user read isolation).
 - Dependencies audited with `cargo audit` on every build bump.
 - Every write goes through a WAL (`~/.palazzo/wal.jsonl` by default) with content previews truncated to 120 chars.
+- **Lock down Qdrant itself.** Qdrant has no auth by default, and anyone who can reach its port can read or wipe the palace without going through palazzo's guards (WAL, confirm flags). Bind it to `127.0.0.1` (or a private network) and enable `service.api_key`; palazzo sends the key on every request via `QDRANT_API_KEY`.
 - `OLLAMA_URL` and `QDRANT_URL` are environment-controlled — anyone who can set env vars on this binary can already execute code as you, so the SSRF surface is accepted.
 - MCP tool outputs (including stored text) are echoed back through the protocol; treat them as untrusted input to whatever LLM consumes them. This is a generic MCP concern, not specific to palazzo.
 
